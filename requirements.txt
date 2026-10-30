@@ -1,0 +1,12 @@
+# 劳动活动签到系统 后端依赖
+fastapi==0.162.0
+uvicorn[standard]==0.54.0
+SQLAlchemy==2.1.6
+pydantic==2.14.1
+PyJWT==2.15.1
+python-multipart==0.0.32
+openpyxl==3.1.5
+email-validator==2.3.0
+
+# 测试（可选）
+httpx==0.28.1

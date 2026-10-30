@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# 数据库与运行数据
+*.db
+*.db-wal
+*.db-shm
+test_smoke.db*
+storage/
+
+# 环境
+.env
+*.pdf
+tests/
+
+# 临时文件
+_extract.py
+_api_doc.txt
+_smoke_out.txt
+_check_models.py
+_dbg.py
+_smoke1.py
