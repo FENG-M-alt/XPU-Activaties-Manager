@@ -1,29 +1,38 @@
-"""管理员账号模型。"""
+"""admins 管理员账号表（文档 4.2）。"""
 from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, Integer, String
+from sqlalchemy import Index, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.enums import AccountStatus, AdminRole, DataScope
-from app.models.base import Base, TimestampMixin
+from app.models.base import Base, BigId, RefId, TimestampMixin, TinyIntU, SoftDeleteMixin
 
 
-class Admin(Base, TimestampMixin):
+class Admin(Base, TimestampMixin, SoftDeleteMixin):
     __tablename__ = "admins"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    username: Mapped[str] = mapped_column(String(50), unique=True, nullable=False, index=True)
+    id: Mapped[int] = mapped_column(BigId, primary_key=True, autoincrement=True)
+    username: Mapped[str] = mapped_column(String(50), nullable=False)
     name: Mapped[str] = mapped_column(String(50), nullable=False)
-    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
-    role: Mapped[str] = mapped_column(String(20), default=AdminRole.ADMIN, nullable=False)
-    data_scope: Mapped[str] = mapped_column(String(16), default=DataScope.SELF, nullable=False)
-    college: Mapped[str | None] = mapped_column(String(100))
-    status: Mapped[str] = mapped_column(String(16), default=AccountStatus.ACTIVE, nullable=False, index=True)
-    is_first_login: Mapped[bool] = mapped_column(default=False, nullable=False)
-    last_login_at: Mapped[datetime | None] = mapped_column(DateTime)
-    password_changed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    password_hash: Mapped[str] = mapped_column(String(100), nullable=False)
+    role: Mapped[str] = mapped_column(String(20), nullable=False, default=AdminRole.ADMIN)
+    data_scope: Mapped[str] = mapped_column(String(16), nullable=False, default=DataScope.SELF)
+    college: Mapped[str | None] = mapped_column(String(50))  # data_scope=COLLEGE 时必填
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default=AccountStatus.ACTIVE)
+    is_first_login: Mapped[bool] = mapped_column(default=True, nullable=False)
+
+    login_fail_count: Mapped[int] = mapped_column(TinyIntU, nullable=False, default=0)
+    locked_until: Mapped[datetime | None] = mapped_column()
+    last_login_at: Mapped[datetime | None] = mapped_column()
+    last_login_ip: Mapped[str | None] = mapped_column(String(45))
+    created_by: Mapped[int | None] = mapped_column(RefId)
+
+    __table_args__ = (
+        Index("uk_username", "username", unique=True),
+        Index("idx_role_status", "role", "status"),
+    )
 
     @property
     def is_super_admin(self) -> bool:

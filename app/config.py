@@ -66,8 +66,17 @@ class Settings:
     DEBUG: bool = _env_bool("DEBUG", True)
 
     # --- 数据库 ---
+    # 开发默认 SQLite；对接《数据库设计说明书》的 MySQL 8.0 时改为：
+    #   mysql+pymysql://lab_checkin:密码@127.0.0.1:3306/lab_checkin?charset=utf8mb4
     DATABASE_URL: str = os.environ.get("DATABASE_URL", f"sqlite:///{(BASE_DIR / 'lab_checkin.db').as_posix()}")
     SQL_ECHO: bool = _env_bool("SQL_ECHO", False)
+    # 是否由 ORM 自动建表：生产建议 false，先执行 sql/ 下的建表脚本
+    AUTO_CREATE_TABLES: bool = _env_bool("AUTO_CREATE_TABLES", True)
+    DB_POOL_SIZE: int = _env_int("DB_POOL_SIZE", 10)
+    DB_MAX_OVERFLOW: int = _env_int("DB_MAX_OVERFLOW", 20)
+    DB_POOL_RECYCLE: int = _env_int("DB_POOL_RECYCLE", 1800)      # 小于 MySQL wait_timeout，避免长连接失效
+    DB_POOL_TIMEOUT: int = _env_int("DB_POOL_TIMEOUT", 30)
+    DB_CONNECT_TIMEOUT: int = _env_int("DB_CONNECT_TIMEOUT", 10)
 
     # --- 认证（文档 2.2） ---
     JWT_SECRET: str = os.environ.get("JWT_SECRET", "dev-only-secret-change-me-in-production")
@@ -132,6 +141,14 @@ class Settings:
     @property
     def is_sqlite(self) -> bool:
         return self.DATABASE_URL.startswith("sqlite")
+
+    @property
+    def is_mysql(self) -> bool:
+        return self.DATABASE_URL.startswith("mysql")
+
+    @property
+    def is_postgres(self) -> bool:
+        return self.DATABASE_URL.startswith("postgresql")
 
     def ensure_dirs(self) -> None:
         for d in (self.UPLOAD_DIR, self.EXPORT_DIR, self.COVER_DIR):

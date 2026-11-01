@@ -7,7 +7,7 @@ from sqlalchemy import or_, select
 from app.core.deps import DbSession
 from app.core.responses import ok
 from app.core.timeutil import now_local
-from app.models.notice import Notice
+from app.models.supplement import Notice
 from app.schemas.serializers import notice_out
 
 router = APIRouter(tags=["用户端-公告"])
@@ -21,7 +21,7 @@ def list_notices(db: DbSession):
         select(Notice)
         .where(
             Notice.is_active.is_(True),
-            Notice.is_deleted.is_(False),
+            Notice.deleted_at.is_(None),
             or_(Notice.start_at.is_(None), Notice.start_at <= now),
             or_(Notice.end_at.is_(None), Notice.end_at >= now),
         )

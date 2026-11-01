@@ -5,13 +5,14 @@ from fastapi import APIRouter, Request, Response
 
 from app.config import settings
 from app.core.deps import CurrentAdmin, DbSession, OptionalPrincipal, PrincipalDep
+from app.core.enums import AccountType
 from app.core.errors import ErrorCode, fail
 from app.core.guards import enforce_rate
 from app.core.responses import ok
 from app.schemas.requests import AdminLoginIn, ChangePasswordIn
 from app.schemas.serializers import admin_profile
 from app.services import auth as auth_service
-from app.services.logs import client_ip, write_log
+from app.services.logs import client_ip, client_ua, write_log
 
 router = APIRouter(tags=["管理端-认证"])
 
@@ -39,13 +40,13 @@ def admin_login(payload: AdminLoginIn, request: Request, response: Response, db:
     admin = result["user"]
     write_log(
         db,
-        actor_type="admin",
-        actor_id=admin.id,
-        actor_name=admin.name,
         action="LOGIN",
-        target_type="admin",
+        operator_type="ADMIN",
+        operator_id=admin.id,
+        target_type="admins",
         target_id=admin.id,
         ip=client_ip(request),
+        ua=client_ua(request),
     )
     db.commit()
 
@@ -67,7 +68,7 @@ def admin_login(payload: AdminLoginIn, request: Request, response: Response, db:
 def admin_refresh(request: Request, db: DbSession):
     refresh = request.cookies.get(settings.REFRESH_COOKIE_NAME)
     access_token, expires_in, session = auth_service.refresh_access_token(db, refresh)
-    if session.account_type != "admin":
+    if session.account_type != AccountType.ADMIN:
         fail(ErrorCode.FORBIDDEN)
     db.commit()
     return ok({"access_token": access_token, "expires_in": expires_in, "token_type": "Bearer"})
@@ -87,12 +88,12 @@ def admin_logout(request: Request, response: Response, db: DbSession, principal:
 
 @router.post("/auth/password", summary="管理员修改密码（扩展）")
 def admin_change_password(payload: ChangePasswordIn, principal: PrincipalDep, db: DbSession):
-    if principal.account_type != "admin" or principal.admin is None:
+    if principal.account_type != AccountType.ADMIN or principal.admin is None:
         fail(ErrorCode.FORBIDDEN)
     auth_service.change_password(
         db,
         principal.admin,
-        account_type="admin",
+        account_type=AccountType.ADMIN,
         old_password=payload.old_password,
         new_password=payload.new_password,
         keep_session_id=principal.session_id,

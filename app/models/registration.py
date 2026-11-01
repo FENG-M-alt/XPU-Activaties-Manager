@@ -1,62 +1,72 @@
-"""报名记录模型。"""
+"""registrations 报名表（文档 4.4）。
+
+说明：
+- 本表不做软删除（文档 2.5 / 4.4）：取消报名置 CANCELLED，再次报名**复用同一行**，
+  重置 signup_at、清空 cancel_reason 与审核字段 —— 因此 uk_activity_user 始终生效。
+- 冗余三个快照字段，统计按快照归属，避免学生转专业后历史数据漂移（文档 6.5）。
+"""
 from __future__ import annotations
 
 from datetime import datetime
-from decimal import Decimal
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, Numeric, String, text
+from sqlalchemy import Index, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.enums import RegistrationStatus, SignupSource
-from app.models.base import Base, TimestampMixin, now_local
+from app.models.base import Base, BigId, RefId, TimestampMixin, now_local
 from app.models.activity import Activity
-from app.models.student import Student
+from app.models.user import User
 
 
 class Registration(Base, TimestampMixin):
     __tablename__ = "registrations"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    activity_id: Mapped[int] = mapped_column(ForeignKey("activities.id", ondelete="CASCADE"), nullable=False, index=True)
-    student_id: Mapped[int] = mapped_column(ForeignKey("students.id", ondelete="CASCADE"), nullable=False, index=True)
+    id: Mapped[int] = mapped_column(BigId, primary_key=True, autoincrement=True)
+    activity_id: Mapped[int] = mapped_column(RefId, nullable=False)
+    user_id: Mapped[int] = mapped_column(RefId, nullable=False)
 
-    status: Mapped[str] = mapped_column(String(16), default=RegistrationStatus.PENDING, nullable=False, index=True)
-    signup_at: Mapped[datetime] = mapped_column(DateTime, default=now_local, nullable=False, index=True)
-    source: Mapped[str] = mapped_column(String(8), default=SignupSource.SELF, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default=RegistrationStatus.PENDING)
 
-    audit_by: Mapped[int | None] = mapped_column(ForeignKey("admins.id"))
-    audit_at: Mapped[datetime | None] = mapped_column(DateTime)
-    audit_remark: Mapped[str | None] = mapped_column(String(500))
+    # 报名时快照（文档 6.5）
+    college_snapshot: Mapped[str] = mapped_column(String(50), nullable=False, default="")
+    major_snapshot: Mapped[str | None] = mapped_column(String(50))
+    class_snapshot: Mapped[str | None] = mapped_column(String(50))
 
-    checkin_at: Mapped[datetime | None] = mapped_column(DateTime)
-    checkin_method: Mapped[str | None] = mapped_column(String(8))
-    checkin_by: Mapped[int | None] = mapped_column(ForeignKey("admins.id"))
-    checkin_reason: Mapped[str | None] = mapped_column(String(500))
-    checkin_ip: Mapped[str | None] = mapped_column(String(64))
-    is_late: Mapped[bool] = mapped_column(default=False, nullable=False)
-    hours_awarded: Mapped[Decimal] = mapped_column(Numeric(4, 1), default=Decimal("0.0"), nullable=False)
+    signup_at: Mapped[datetime] = mapped_column(nullable=False, default=now_local)
+    source: Mapped[str] = mapped_column(String(16), nullable=False, default=SignupSource.SELF)
 
-    cancel_reason: Mapped[str | None] = mapped_column(String(500))
-    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime)
-    cancelled_by: Mapped[int | None] = mapped_column(ForeignKey("admins.id"))
+    audit_by: Mapped[int | None] = mapped_column(RefId)
+    audit_at: Mapped[datetime | None] = mapped_column()
+    audit_remark: Mapped[str | None] = mapped_column(String(200))
 
-    activity: Mapped[Activity] = relationship(lazy="joined")
-    student: Mapped[Student] = relationship(lazy="joined")
+    checkin_at: Mapped[datetime | None] = mapped_column()
+    checkin_method: Mapped[str | None] = mapped_column(String(16))  # CODE / MANUAL
+    is_late: Mapped[bool] = mapped_column(nullable=False, default=False)
+    cancel_reason: Mapped[str | None] = mapped_column(String(200))
 
     __table_args__ = (
-        # 同一学生对同一活动仅一条有效记录；CANCELLED / REJECTED 不占用唯一性（文档 7.1.5）
-        Index(
-            "uq_registrations_active",
-            "activity_id",
-            "student_id",
-            unique=True,
-            sqlite_where=text("status NOT IN ('CANCELLED', 'REJECTED')"),
-            postgresql_where=text("status NOT IN ('CANCELLED', 'REJECTED')"),
-        ),
-        Index("ix_registrations_activity_status", "activity_id", "status"),
-        Index("ix_registrations_student_status", "student_id", "status"),
+        Index("uk_activity_user", "activity_id", "user_id", unique=True),
+        Index("idx_user_status", "user_id", "status"),
+        Index("idx_activity_status", "activity_id", "status"),
+        Index("idx_checkin_at", "checkin_at"),
+    )
+
+    activity: Mapped[Activity] = relationship(
+        primaryjoin="foreign(Registration.activity_id) == Activity.id",
+        lazy="joined",
+        viewonly=True,
+    )
+    user: Mapped[User] = relationship(
+        primaryjoin="foreign(Registration.user_id) == User.id",
+        lazy="joined",
+        viewonly=True,
     )
 
     @property
     def is_checked_in(self) -> bool:
         return self.status in (RegistrationStatus.CHECKED_IN, RegistrationStatus.COMPLETED)
+
+    # 兼容旧代码命名
+    @property
+    def student(self) -> User:
+        return self.user

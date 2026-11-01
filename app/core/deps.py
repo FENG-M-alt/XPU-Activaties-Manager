@@ -1,19 +1,27 @@
-"""FastAPI 依赖：数据库、当前用户、权限与数据范围（文档 2.7）。"""
+"""FastAPI 依赖：数据库、当前用户、权限与数据范围（文档 2.7）。
+
+账号类型统一使用 ``user`` / ``admin``（对应 users / admins 两张表）。
+数据范围（data_scope）：
+- ALL     全校数据；
+- COLLEGE 本学院数据 —— activities 表无学院字段，按"创建人属于本学院"过滤，
+          报名/学生数据按快照字段或 users.college 过滤；
+- SELF    仅本人创建。
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Annotated
 
-from fastapi import Depends, Header, Request
-from sqlalchemy import or_
+from fastapi import Depends, Header
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from app.core.enums import AccountStatus, AdminRole, DataScope
+from app.core.enums import AccountStatus, AccountType, AdminRole, DataScope
 from app.core.errors import ErrorCode, fail
 from app.core.security import decode_token
 from app.database import get_db
 from app.models.admin import Admin
-from app.models.student import Student
+from app.models.user import User
 from app.services.auth import get_session
 
 DbSession = Annotated[Session, Depends(get_db)]
@@ -26,8 +34,13 @@ class Principal:
     account_type: str
     id: int
     session_id: str
-    student: Student | None = None
+    user: User | None = None
     admin: Admin | None = None
+
+    @property
+    def student(self) -> User | None:
+        """兼容旧调用：学生主体即 user。"""
+        return self.user
 
 
 def _bearer_token(authorization: str | None) -> str | None:
@@ -81,51 +94,51 @@ def _resolve_principal(
     except (TypeError, ValueError):
         fail(ErrorCode.UNAUTHORIZED)
 
-    if account_type == "student":
-        student = db.get(Student, account_id)
-        if student is None:
+    if account_type == AccountType.USER:
+        user = db.get(User, account_id)
+        if user is None or user.deleted_at is not None:
             fail(ErrorCode.UNAUTHORIZED)
-        if student.status != AccountStatus.ACTIVE:
+        if user.status != AccountStatus.ACTIVE:
             fail(ErrorCode.ACCOUNT_DISABLED)
-        if session.account_id != student.id:
+        if session.account_id != user.id:
             fail(ErrorCode.UNAUTHORIZED)
-        return Principal(account_type="student", id=student.id, session_id=session_id, student=student)
+        return Principal(account_type=AccountType.USER, id=user.id, session_id=session_id, user=user)
 
-    if account_type == "admin":
+    if account_type == AccountType.ADMIN:
         admin = db.get(Admin, account_id)
-        if admin is None:
+        if admin is None or admin.deleted_at is not None:
             fail(ErrorCode.UNAUTHORIZED)
         if admin.status != AccountStatus.ACTIVE:
             fail(ErrorCode.ACCOUNT_DISABLED)
         if session.account_id != admin.id:
             fail(ErrorCode.UNAUTHORIZED)
-        return Principal(account_type="admin", id=admin.id, session_id=session_id, admin=admin)
+        return Principal(account_type=AccountType.ADMIN, id=admin.id, session_id=session_id, admin=admin)
 
     fail(ErrorCode.UNAUTHORIZED)
 
 
-def get_current_student(
+def get_current_user(
     db: DbSession,
     authorization: Annotated[str | None, Header(alias="Authorization")] = None,
-) -> Student:
-    principal = _resolve_principal(db, authorization, required_type="student")
-    assert principal and principal.student is not None
-    return principal.student
+) -> User:
+    principal = _resolve_principal(db, authorization, required_type=AccountType.USER)
+    assert principal and principal.user is not None
+    return principal.user
 
 
-def get_optional_student(
+def get_optional_user(
     db: DbSession,
     authorization: Annotated[str | None, Header(alias="Authorization")] = None,
-) -> Student | None:
-    principal = _resolve_principal(db, authorization, required_type="student", optional=True)
-    return principal.student if principal else None
+) -> User | None:
+    principal = _resolve_principal(db, authorization, required_type=AccountType.USER, optional=True)
+    return principal.user if principal else None
 
 
 def get_current_admin(
     db: DbSession,
     authorization: Annotated[str | None, Header(alias="Authorization")] = None,
 ) -> Admin:
-    principal = _resolve_principal(db, authorization, required_type="admin")
+    principal = _resolve_principal(db, authorization, required_type=AccountType.ADMIN)
     assert principal and principal.admin is not None
     return principal.admin
 
@@ -153,8 +166,11 @@ def require_super_admin(admin: Annotated[Admin, Depends(get_current_admin)]) -> 
     return admin
 
 
-CurrentStudent = Annotated[Student, Depends(get_current_student)]
-OptionalStudent = Annotated[Student | None, Depends(get_optional_student)]
+# 学生端主体（保留 CurrentStudent 命名，语义即 users 表记录）
+CurrentUser = Annotated[User, Depends(get_current_user)]
+OptionalUser = Annotated[User | None, Depends(get_optional_user)]
+CurrentStudent = CurrentUser
+OptionalStudent = OptionalUser
 CurrentAdmin = Annotated[Admin, Depends(get_current_admin)]
 SuperAdmin = Annotated[Admin, Depends(require_super_admin)]
 PrincipalDep = Annotated[Principal, Depends(get_current_principal)]
@@ -162,38 +178,54 @@ OptionalPrincipal = Annotated[Principal | None, Depends(get_optional_principal)]
 
 
 # ---------------------------------------------------------------- 数据范围
-def activity_scope_conditions(admin: Admin) -> list:
-    """管理端查询按 data_scope 过滤（文档 2.7）。"""
+def _college_admin_ids(db: Session, college: str) -> list[int]:
+    """本学院管理员的 id 列表（activities 无学院字段，用创建人归属推断）。"""
+    rows = db.scalars(
+        select(Admin.id).where(Admin.college == college, Admin.deleted_at.is_(None))
+    ).all()
+    return list(rows)
+
+
+def activity_scope_conditions(admin: Admin, db: Session | None = None) -> list:
+    """管理端活动查询按 data_scope 过滤（文档 2.7）。"""
     from app.models.activity import Activity
 
     if admin.role == AdminRole.SUPER_ADMIN or admin.data_scope == DataScope.ALL:
         return []
     if admin.data_scope == DataScope.COLLEGE:
         conditions = [Activity.created_by == admin.id]
-        if admin.college:
-            conditions.append(Activity.college == admin.college)
+        if admin.college and db is not None:
+            ids = _college_admin_ids(db, admin.college)
+            if ids:
+                conditions.append(Activity.created_by.in_(ids))
         return [or_(*conditions)]
     return [Activity.created_by == admin.id]
 
 
-def can_access_activity(admin: Admin, activity) -> bool:
+def can_access_activity(admin: Admin, activity, db: Session | None = None) -> bool:
     if admin.role == AdminRole.SUPER_ADMIN or admin.data_scope == DataScope.ALL:
         return True
-    if admin.data_scope == DataScope.COLLEGE:
-        return activity.created_by == admin.id or (admin.college is not None and activity.college == admin.college)
-    return activity.created_by == admin.id
+    if activity.created_by == admin.id:
+        return True
+    if admin.data_scope == DataScope.COLLEGE and admin.college and db is not None:
+        creator = db.get(Admin, activity.created_by) if activity.created_by else None
+        return bool(creator and creator.college == admin.college)
+    return False
 
 
-def ensure_activity_access(admin: Admin, activity) -> None:
-    if not can_access_activity(admin, activity):
+def ensure_activity_access(admin: Admin, activity, db: Session | None = None) -> None:
+    if not can_access_activity(admin, activity, db):
         fail(ErrorCode.FORBIDDEN)
 
 
-def ensure_student_scope(admin: Admin, student: Student) -> None:
-    """管理员访问学生数据的范围校验。"""
+def ensure_user_scope(admin: Admin, user: User) -> None:
+    """管理员访问学生数据的范围校验（按 users.college）。"""
     if admin.role == AdminRole.SUPER_ADMIN or admin.data_scope == DataScope.ALL:
         return
-    if admin.data_scope == DataScope.COLLEGE:
-        if admin.college and student.college == admin.college:
-            return
+    if admin.data_scope == DataScope.COLLEGE and admin.college and user.college == admin.college:
+        return
     fail(ErrorCode.FORBIDDEN)
+
+
+# 兼容旧命名
+ensure_student_scope = ensure_user_scope

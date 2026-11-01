@@ -4,14 +4,15 @@ from __future__ import annotations
 from fastapi import APIRouter, Request, Response
 
 from app.config import settings
-from app.core.deps import CurrentStudent, DbSession, OptionalPrincipal, PrincipalDep, get_optional_student
+from app.core.deps import CurrentUser, DbSession, OptionalPrincipal, PrincipalDep, get_optional_user
+from app.core.enums import AccountType
 from app.core.errors import ErrorCode, fail
 from app.core.guards import enforce_rate
 from app.core.responses import ok
 from app.schemas.requests import ChangePasswordIn, StudentLoginIn
 from app.schemas.serializers import student_public
 from app.services import auth as auth_service
-from app.services.logs import client_ip, write_log
+from app.services.logs import client_ip, client_ua, write_log
 
 router = APIRouter(tags=["认证与会话"])
 
@@ -25,13 +26,13 @@ def student_login(payload: StudentLoginIn, request: Request, response: Response,
     auth_service.set_refresh_cookie(response, result["refresh_token"])
     write_log(
         db,
-        actor_type="student",
-        actor_id=result["user"].id,
-        actor_name=result["user"].name,
         action="LOGIN",
-        target_type="student",
+        operator_type="STUDENT",
+        operator_id=result["user"].id,
+        target_type="users",
         target_id=result["user"].id,
         ip=client_ip(request),
+        ua=client_ua(request),
     )
     db.commit()
 
@@ -69,28 +70,34 @@ def logout(request: Request, response: Response, db: DbSession, principal: Optio
 
 
 @router.post("/auth/password", summary="U-04 修改密码")
-def change_password(payload: ChangePasswordIn, principal: PrincipalDep, request: Request, response: Response, db: DbSession):
-    """修改成功后注销其他会话（文档 2.2）。"""
-    if principal.account_type != "student" or principal.student is None:
+def change_password(
+    payload: ChangePasswordIn,
+    principal: PrincipalDep,
+    request: Request,
+    response: Response,
+    db: DbSession,
+):
+    """修改成功后注销其他会话（接口文档 2.2）。"""
+    if principal.account_type != AccountType.USER or principal.user is None:
         fail(ErrorCode.FORBIDDEN)
-    student = principal.student
+    user = principal.user
     auth_service.change_password(
         db,
-        student,
-        account_type="student",
+        user,
+        account_type=AccountType.USER,
         old_password=payload.old_password,
         new_password=payload.new_password,
         keep_session_id=principal.session_id,
     )
     write_log(
         db,
-        actor_type="student",
-        actor_id=student.id,
-        actor_name=student.name,
         action="CHANGE_PASSWORD",
-        target_type="student",
-        target_id=student.id,
+        operator_type="STUDENT",
+        operator_id=user.id,
+        target_type="users",
+        target_id=user.id,
         ip=client_ip(request),
+        ua=client_ua(request),
     )
     db.commit()
     return ok({"is_first_login": False}, message="密码修改成功")
@@ -98,7 +105,7 @@ def change_password(payload: ChangePasswordIn, principal: PrincipalDep, request:
 
 @router.get("/auth/check", summary="校验当前会话是否有效（辅助接口）")
 def check_session(db: DbSession, request: Request):
-    student = get_optional_student(db=db, authorization=request.headers.get("authorization"))
-    if student is None:
+    user = get_optional_user(db=db, authorization=request.headers.get("authorization"))
+    if user is None:
         return ok({"authenticated": False})
-    return ok({"authenticated": True, "student_no": student.student_no, "name": student.name})
+    return ok({"authenticated": True, "student_no": user.student_no, "name": user.name})

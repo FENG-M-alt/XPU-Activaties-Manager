@@ -18,7 +18,10 @@ RANGE_PRESETS = {"7d": 7, "30d": 30, "90d": 90, "180d": 180}
 
 def _range_bounds(range_: str | None, start_date: date | None, end_date: date | None, now: datetime):
     if start_date or end_date:
-        return (day_start(start_date) if start_date else None, day_end(end_date) if end_date else None)
+        return (
+            day_start(start_date) if start_date else None,
+            day_end(end_date) if end_date else None,
+        )
     key = (range_ or "30d").lower()
     if key in RANGE_PRESETS:
         return day_start(now) - timedelta(days=RANGE_PRESETS[key] - 1), day_end(now)
@@ -44,14 +47,17 @@ def stats_overview(
     start, end = _range_bounds(range, start_date, end_date, now)
     data = stats_service.overview(
         db,
-        activity_scope_conditions(admin),
+        activity_scope_conditions(admin, db),
         range_start=start,
         range_end=end,
         college=college,
         type_id=type_id,
         now=now,
     )
-    data["range"] = {"start": start.isoformat() if start else None, "end": end.isoformat() if end else None}
+    data["range"] = {
+        "start": start.isoformat() if start else None,
+        "end": end.isoformat() if end else None,
+    }
     return ok(data)
 
 
@@ -70,7 +76,7 @@ def stats_activities(
     pagination = Pagination(page, page_size, default_size=settings.DEFAULT_PAGE_SIZE_ADMIN)
     items, total = stats_service.stats_by_activity(
         db,
-        activity_scope_conditions(admin),
+        activity_scope_conditions(admin, db),
         page_offset=pagination.offset,
         limit=pagination.page_size,
         keyword=keyword,
@@ -95,7 +101,7 @@ def stats_students(
     pagination = Pagination(page, page_size, default_size=settings.DEFAULT_PAGE_SIZE_ADMIN)
     items, total = stats_service.stats_by_student(
         db,
-        activity_scope_conditions(admin),
+        activity_scope_conditions(admin, db),
         page_offset=pagination.offset,
         limit=pagination.page_size,
         keyword=keyword,
@@ -115,7 +121,7 @@ def stats_colleges(
     """按学院聚合：在册学生数、参与人数、参与率、活动数、人均学时、签到率。"""
     items = stats_service.stats_by_college(
         db,
-        activity_scope_conditions(admin),
+        activity_scope_conditions(admin, db),
         range_start=day_start(start_date) if start_date else None,
         range_end=day_end(end_date) if end_date else None,
     )

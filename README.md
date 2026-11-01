@@ -239,3 +239,79 @@ tests/smoke_test.py          # 端到端冒烟测试（独立 test_smoke.db）
 4. 多 worker 时把限流/幂等/验证码迁移到 Redis；`ENABLE_STATE_TASK` 仅在一个实例开启，或改用外部调度。
 5. 反向代理透传 `X-Forwarded-For`（审计与限流依赖 IP）。
 6. 导出目录 `storage/exports`、封面 `storage/covers` 挂载持久卷并配置清理策略。
+
+
+---
+
+# 附：数据库对接（《数据库设计说明书 V1.0》）
+
+后端已按 `数据库设计说明书_V1.0.pdf`（LAB-CHECKIN-DB-001）重构数据层：**官方 9 张表的表名、字段、索引与文档逐字一致**，接口行为保持不变。
+
+## 1. 表清单
+
+**官方 9 张表**（`sql/01_schema_core.sql`，逐字对应文档附录 A）
+
+| 表 | 说明 | 模型文件 |
+| --- | --- | --- |
+| `users` | 学生账号（含 `id_card_enc`、`login_fail_count`、`locked_until`、`import_batch_id`） | `app/models/user.py` |
+| `admins` | 管理员账号 | `app/models/admin.py` |
+| `activities` | 活动（无报名人数冗余列；`type_id` 关联字典） | `app/models/activity.py` |
+| `registrations` | 报名（`user_id` + 三个快照字段；取消复用原行） | `app/models/registration.py` |
+| `checkin_logs` | 签到流水（只追加，CHECKIN/UNDO） | `app/models/checkin_log.py` |
+| `import_batches` | 导入批次（失败明细走 `error_file_url`） | `app/models/import_batch.py` |
+| `operation_logs` | 操作日志（`operator_type` + JSON `detail` + `ua` + `result`） | `app/models/operation_log.py` |
+| `settings` | 系统参数（`key` 为保留字，需反引号） | `app/models/setting.py` |
+| `dict_items` | 字典项（活动类型/拒绝理由/公告分类） | `app/models/dict_item.py` |
+
+**补充 3 张表**（`sql/02_schema_supplement.sql`）—— 设计说明书未建模，但接口契约必需：
+
+| 表 | 对应接口 | 若移除的后果 |
+| --- | --- | --- |
+| `auth_sessions` | 2.2 会话上限 3、改密后其他会话失效、退出登录 | 刷新令牌无法撤销 |
+| `notices` | 4.11 / U-17 公告列表与有效期 | 公告无法持久化 |
+| `export_tasks` | A-21 / A-32 异步导出与 7 天下载 | 异步导出不可用 |
+
+## 2. 建库步骤（MySQL 8.0）
+
+```bash
+mysql -u root -p -e "CREATE DATABASE lab_checkin DEFAULT CHARSET utf8mb4 COLLATE utf8mb4_0900_ai_ci;"
+mysql -u root -p -e "CREATE USER 'lab_checkin'@'localhost' IDENTIFIED BY '你的密码'; GRANT SELECT,INSERT,UPDATE,DELETE ON lab_checkin.* TO 'lab_checkin'@'localhost';"
+mysql -u lab_checkin -p lab_checkin < sql/01_schema_core.sql
+mysql -u lab_checkin -p lab_checkin < sql/02_schema_supplement.sql
+mysql -u lab_checkin -p lab_checkin < sql/03_init_data.sql   # 字典 9.1 + 参数 9.2
+```
+
+然后在 `.env` 中设置：
+
+```ini
+DATABASE_URL=mysql+pymysql://lab_checkin:你的密码@127.0.0.1:3306/lab_checkin?charset=utf8mb4
+AUTO_CREATE_TABLES=false
+```
+
+启动后访问 `/api/v1/health` 验证连通性；首次启动保持 `AUTO_SEED=true` 可自动写入管理员与示例学生（bcrypt 哈希无法用 SQL 生成，故账号由应用侧写入）。
+
+## 3. 本次数据层重构要点
+
+| 原实现 | 现实现（按文档） |
+| --- | --- |
+| `students` 表 | `users` 表 |
+| `registrations.student_id` | `registrations.user_id` |
+| 报名 `hours_awarded` 列 | 取消；学时一律取 `activities.hours` 按状态聚合 |
+| `activities.registered_count` 冗余列 | 取消；有效报名数按 `registrations` 状态实时聚合（文档 4.3 末段） |
+| `activities.college` / `published_at` / `cancel_reason` 等 | 取消；发布/取消/结束时间与原因写入 `operation_logs` |
+| `login_attempts` / `checkin_attempts` 表 | 登录失败用 `users/admins.login_fail_count` + `locked_until`；签到连错计数走进程内 TTL |
+| `activity_types` 表 | 并入 `dict_items`（`dict_type='activity_type'`） |
+| `system_settings` 表 | `settings`（`key`/`value`/`remark`/`updated_by`/`updated_at`） |
+| 签到码历史表 `activity_checkin_codes` | 取消；旧码保留在进程内 TTL 缓存，仍可区分 40905 / 40910 |
+| `registration` 部分唯一索引 | 改为文档要求的无条件 `uk_activity_user`；取消后复用原行 |
+| 密码 PBKDF2 | bcrypt（cost=12），兼容校验历史 PBKDF2 哈希并在登录时自动升级 |
+| 报名写入用 `registered_count` 原子加减 | 按文档 6.2：`SELECT ... FOR UPDATE` 锁活动行 → 统计 → 插入 |
+
+## 4. 保持不变
+
+- 全部 53 个接口的路径、方法、请求参数与响应字段；
+- 统一响应信封 `{code, message, data, trace_id}`、错误码总表、分页规则；
+- 鉴权（JWT + refresh Cookie）、限流、幂等、数据范围过滤；
+- 时间语义（东八区、ISO 8601 `+08:00`）。
+
+> 说明：本次仅完成代码与建表脚本的对接，未连接、未执行、未测试任何真实数据库实例。

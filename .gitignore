@@ -11,12 +11,14 @@ venv/
 *.db-shm
 test_smoke.db*
 storage/
+_dbdoc.txt
 
 # 环境
 .env
 *.pdf
 tests/
-
+images/
+sql/
 # 临时文件
 _extract.py
 _api_doc.txt

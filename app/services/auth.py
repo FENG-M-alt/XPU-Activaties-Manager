@@ -1,21 +1,27 @@
-"""认证与会话（文档 2.2 / 第 3 章）。"""
+"""认证与会话（接口文档 2.2 / 第 3 章；数据库文档 4.1 / 4.2）。
+
+登录失败锁定改为使用 users / admins 表的 login_fail_count 与 locked_until
+（数据库文档 1.2 差异说明 2），不再单独落登录尝试表；
+策略从 settings 表的 student_login_lock / admin_login_lock 读取，格式 "次数:分钟"。
+"""
 from __future__ import annotations
 
 from datetime import datetime, timedelta
 
 from fastapi import Request
-from sqlalchemy import delete, select, update
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.core.cache import cache
-from app.core.enums import AccountStatus, AdminRole, DataScope
+from app.core.enums import AccountStatus, AccountType, AdminRole, DataScope
 from app.core.errors import ErrorCode, fail
 from app.core.security import (
     create_access_token,
     generate_captcha_code,
     hash_password,
     hash_token,
+    password_needs_rehash,
     random_token,
     render_captcha_svg,
     svg_to_data_url,
@@ -23,8 +29,9 @@ from app.core.security import (
 )
 from app.core.timeutil import now_local
 from app.models.admin import Admin
-from app.models.audit import AuthSession, LoginAttempt
-from app.models.student import Student
+from app.models.setting import Setting
+from app.models.supplement import AuthSession
+from app.models.user import User
 
 
 # ---------------------------------------------------------------- 会话
@@ -42,7 +49,7 @@ def _revoke_expired(db: Session, account_type: str, account_id: int) -> None:
 
 
 def enforce_session_limit(db: Session, account_type: str, account_id: int) -> None:
-    """同一账号最多 3 个有效会话，超出后最早会话失效（文档 2.2）。"""
+    """同一账号最多 3 个有效会话，超出后最早会话失效（接口文档 2.2）。"""
     _revoke_expired(db, account_type, account_id)
     sessions = db.scalars(
         select(AuthSession)
@@ -128,7 +135,9 @@ def revoke_session_by_id(db: Session, session_id: str) -> None:
 def revoke_session_by_refresh(db: Session, refresh_token: str) -> bool:
     token_hash = hash_token(refresh_token)
     session = db.scalars(
-        select(AuthSession).where(AuthSession.refresh_hash == token_hash, AuthSession.revoked_at.is_(None))
+        select(AuthSession).where(
+            AuthSession.refresh_hash == token_hash, AuthSession.revoked_at.is_(None)
+        )
     ).first()
     if not session:
         return False
@@ -136,7 +145,9 @@ def revoke_session_by_refresh(db: Session, refresh_token: str) -> bool:
     return True
 
 
-def revoke_other_sessions(db: Session, account_type: str, account_id: int, keep_session_id: str | None) -> None:
+def revoke_other_sessions(
+    db: Session, account_type: str, account_id: int, keep_session_id: str | None
+) -> None:
     stmt = update(AuthSession).where(
         AuthSession.account_type == account_type,
         AuthSession.account_id == account_id,
@@ -157,15 +168,13 @@ def refresh_access_token(
     *,
     now: datetime | None = None,
 ) -> tuple[str, int, AuthSession]:
-    """凭 Cookie 中的 refresh token 换取新的 access token（文档 3.2）。"""
+    """凭 Cookie 中的 refresh token 换取新的 access token（接口文档 3.2）。"""
     now = now or now_local()
     if not refresh_token:
         fail(ErrorCode.UNAUTHORIZED, "缺少刷新令牌，请重新登录")
 
     token_hash = hash_token(refresh_token)
-    session = db.scalars(
-        select(AuthSession).where(AuthSession.refresh_hash == token_hash)
-    ).first()
+    session = db.scalars(select(AuthSession).where(AuthSession.refresh_hash == token_hash)).first()
     if session is None or session.revoked_at is not None or session.expires_at <= now:
         fail(ErrorCode.UNAUTHORIZED, "登录已失效，请重新登录")
 
@@ -186,117 +195,95 @@ def refresh_access_token(
 
 
 def _load_account(db: Session, account_type: str, account_id: int):
-    if account_type == "student":
-        student = db.get(Student, account_id)
-        return student, None
+    if account_type == AccountType.USER:
+        return db.get(User, account_id), None
     admin = db.get(Admin, account_id)
     return admin, (admin.role if admin else None)
 
 
-# ---------------------------------------------------------------- 失败锁定
-def _since(minutes: int, now: datetime) -> datetime:
-    return now - timedelta(minutes=minutes)
-
-
-def failure_count(db: Session, account_type: str, account: str, minutes: int, now: datetime) -> int:
-    from sqlalchemy import func
-
-    return int(
-        db.scalar(
-            select(func.count())
-            .select_from(LoginAttempt)
-            .where(
-                LoginAttempt.account_type == account_type,
-                LoginAttempt.account == account,
-                LoginAttempt.success.is_(False),
-                LoginAttempt.created_at >= _since(minutes, now),
-            )
-        )
-        or 0
+# ---------------------------------------------------------------- 锁定策略
+def _lock_policy(db: Session, account_type: str) -> tuple[int, int]:
+    """返回 (最大失败次数, 锁定分钟数)；优先取 settings 表配置。"""
+    key = "student_login_lock" if account_type == AccountType.USER else "admin_login_lock"
+    fallback_max = settings.LOGIN_MAX_FAILURES
+    fallback_minutes = (
+        settings.STUDENT_LOCK_MINUTES
+        if account_type == AccountType.USER
+        else settings.ADMIN_LOCK_MINUTES
     )
+    row = db.get(Setting, key)
+    if row and row.value and ":" in row.value:
+        left, _, right = row.value.partition(":")
+        try:
+            return max(int(left), 1), max(int(right), 1)
+        except ValueError:
+            pass
+    return fallback_max, fallback_minutes
 
 
-def last_failure_at(db: Session, account_type: str, account: str) -> datetime | None:
-    from sqlalchemy import func
-
-    return db.scalar(
-        select(func.max(LoginAttempt.created_at)).where(
-            LoginAttempt.account_type == account_type,
-            LoginAttempt.account == account,
-            LoginAttempt.success.is_(False),
-        )
-    )
-
-
-def check_locked(db: Session, account_type: str, account: str, lock_minutes: int, now: datetime) -> None:
-    failures = failure_count(db, account_type, account, lock_minutes, now)
-    if failures >= settings.LOGIN_MAX_FAILURES:
-        last = last_failure_at(db, account_type, account)
-        remaining = lock_minutes
-        if last:
-            remaining = max(int((last + timedelta(minutes=lock_minutes) - now).total_seconds() // 60), 1)
+def _ensure_not_locked(account) -> None:
+    now = now_local()
+    if account.locked_until and account.locked_until > now:
+        remaining = max(int((account.locked_until - now).total_seconds() // 60), 1)
         fail(ErrorCode.LOGIN_LOCKED, f"失败次数过多，请 {remaining} 分钟后重试")
 
 
-def record_attempt(
-    db: Session,
-    *,
-    account_type: str,
-    account: str,
-    success: bool,
-    request: Request | None,
-    now: datetime,
-) -> int:
-    db.add(
-        LoginAttempt(
-            account_type=account_type,
-            account=account,
-            ip=_ip(request),
-            success=success,
-            user_agent=_ua(request),
-            created_at=now,
-        )
-    )
+def _on_login_failure(db: Session, account, account_type: str) -> None:
+    """累加失败次数，达到阈值则写入锁定截止时间（users/admins 表的字段）。"""
+    max_failures, lock_minutes = _lock_policy(db, account_type)
+    account.login_fail_count = int(account.login_fail_count or 0) + 1
+    if account.login_fail_count >= max_failures:
+        account.locked_until = now_local() + timedelta(minutes=lock_minutes)
+        account.login_fail_count = 0
+    db.add(account)
     db.commit()
-    if success:
-        return 0
-    return failure_count(db, account_type, account, settings.STUDENT_LOCK_MINUTES, now)
+    if account.locked_until and account.locked_until > now_local():
+        fail(ErrorCode.LOGIN_LOCKED, f"失败次数过多，请 {lock_minutes} 分钟后重试")
+
+
+def _on_login_success(db: Session, account, request: Request | None) -> None:
+    account.login_fail_count = 0
+    account.locked_until = None
+    account.last_login_at = now_local()
+    account.last_login_ip = _ip(request)
+    db.add(account)
 
 
 # ---------------------------------------------------------------- 学生登录
 def login_student(db: Session, student_no: str, password: str, request: Request | None = None) -> dict:
-    now = now_local()
-    check_locked(db, "student", student_no, settings.STUDENT_LOCK_MINUTES, now)
+    user = db.scalars(
+        select(User).where(User.student_no == student_no, User.deleted_at.is_(None))
+    ).first()
 
-    student = db.scalars(select(Student).where(Student.student_no == student_no)).first()
-    if student is None or not verify_password(password, student.password_hash):
-        count = record_attempt(db, account_type="student", account=student_no, success=False, request=request, now=now)
-        if count >= settings.LOGIN_MAX_FAILURES:
-            fail(ErrorCode.LOGIN_LOCKED, f"失败次数过多，请 {settings.STUDENT_LOCK_MINUTES} 分钟后重试")
-        # 不区分账号是否存在（文档 3.1）
-        raise_login_failure()
+    if user is None:
+        fail(ErrorCode.BAD_CREDENTIALS, "学号或密码错误")
 
-    if student.status != AccountStatus.ACTIVE:
-        record_attempt(db, account_type="student", account=student_no, success=False, request=request, now=now)
+    _ensure_not_locked(user)
+
+    if not verify_password(password, user.password_hash):
+        _on_login_failure(db, user, AccountType.USER)
+        fail(ErrorCode.BAD_CREDENTIALS, "学号或密码错误")
+
+    if user.status != AccountStatus.ACTIVE:
+        _on_login_failure(db, user, AccountType.USER)
         fail(ErrorCode.ACCOUNT_DISABLED)
 
-    record_attempt(db, account_type="student", account=student_no, success=True, request=request, now=now)
-    student.last_login_at = now
+    # 历史 PBKDF2 哈希在登录成功时平滑升级为 bcrypt
+    if password_needs_rehash(user.password_hash):
+        user.password_hash = hash_password(password)
+
+    _on_login_success(db, user, request)
     access_token, expires_in, refresh_token = create_session(
-        db, account_type="student", account_id=student.id, request=request
+        db, account_type=AccountType.USER, account_id=user.id, request=request
     )
     db.commit()
     return {
         "access_token": access_token,
         "expires_in": expires_in,
         "refresh_token": refresh_token,
-        "is_first_login": student.is_first_login,
-        "user": student,
+        "is_first_login": user.is_first_login,
+        "user": user,
     }
-
-
-def raise_login_failure() -> None:
-    fail(ErrorCode.BAD_CREDENTIALS, "学号或密码错误")
 
 
 # ---------------------------------------------------------------- 验证码
@@ -312,7 +299,7 @@ def issue_captcha() -> dict:
 
 
 def verify_captcha(captcha_id: str, captcha_code: str) -> bool:
-    """5 分钟有效、一次使用失效（文档 3.6）。"""
+    """5 分钟有效、一次使用失效（接口文档 3.6）。"""
     if not captcha_id or not captcha_code:
         return False
     expected = cache.pop(f"captcha:{captcha_id}")
@@ -324,28 +311,47 @@ def verify_captcha(captcha_id: str, captcha_code: str) -> bool:
 
 
 # ---------------------------------------------------------------- 管理员登录
-def login_admin(db: Session, username: str, password: str, captcha_id: str, captcha_code: str, request: Request | None = None) -> dict:
-    now = now_local()
+def login_admin(
+    db: Session,
+    username: str,
+    password: str,
+    captcha_id: str,
+    captcha_code: str,
+    request: Request | None = None,
+) -> dict:
     if not verify_captcha(captcha_id, captcha_code):
-        fail(ErrorCode.PARAM_INVALID, "验证码错误或已失效", data={"field": "captcha_code", "reason": "验证码错误或已失效"})
+        fail(
+            ErrorCode.PARAM_INVALID,
+            "验证码错误或已失效",
+            data={"field": "captcha_code", "reason": "验证码错误或已失效"},
+        )
 
-    check_locked(db, "admin", username, settings.ADMIN_LOCK_MINUTES, now)
+    admin = db.scalars(
+        select(Admin).where(Admin.username == username, Admin.deleted_at.is_(None))
+    ).first()
+    if admin is None:
+        fail(ErrorCode.BAD_CREDENTIALS, "账号或密码错误")
 
-    admin = db.scalars(select(Admin).where(Admin.username == username)).first()
-    if admin is None or not verify_password(password, admin.password_hash):
-        count = record_attempt(db, account_type="admin", account=username, success=False, request=request, now=now)
-        if count >= settings.LOGIN_MAX_FAILURES:
-            fail(ErrorCode.LOGIN_LOCKED, f"失败次数过多，请 {settings.ADMIN_LOCK_MINUTES} 分钟后重试")
+    _ensure_not_locked(admin)
+
+    if not verify_password(password, admin.password_hash):
+        _on_login_failure(db, admin, AccountType.ADMIN)
         fail(ErrorCode.BAD_CREDENTIALS, "账号或密码错误")
 
     if admin.status != AccountStatus.ACTIVE:
-        record_attempt(db, account_type="admin", account=username, success=False, request=request, now=now)
+        _on_login_failure(db, admin, AccountType.ADMIN)
         fail(ErrorCode.ACCOUNT_DISABLED)
 
-    record_attempt(db, account_type="admin", account=username, success=True, request=request, now=now)
-    admin.last_login_at = now
+    if password_needs_rehash(admin.password_hash):
+        admin.password_hash = hash_password(password)
+
+    _on_login_success(db, admin, request)
     access_token, expires_in, refresh_token = create_session(
-        db, account_type="admin", account_id=admin.id, request=request, role=admin.role
+        db,
+        account_type=AccountType.ADMIN,
+        account_id=admin.id,
+        request=request,
+        role=admin.role,
     )
     db.commit()
     return {
@@ -358,12 +364,23 @@ def login_admin(db: Session, username: str, password: str, captcha_id: str, capt
 
 
 # ---------------------------------------------------------------- 修改密码
-def change_password(db: Session, account, *, account_type: str, old_password: str, new_password: str, keep_session_id: str | None) -> None:
+def change_password(
+    db: Session,
+    account,
+    *,
+    account_type: str,
+    old_password: str,
+    new_password: str,
+    keep_session_id: str | None,
+) -> None:
     from app.core.security import password_strength_error
 
-    now = now_local()
     if not verify_password(old_password, account.password_hash):
-        fail(ErrorCode.PARAM_INVALID, "原密码不正确", data={"field": "old_password", "reason": "原密码不正确"})
+        fail(
+            ErrorCode.PARAM_INVALID,
+            "原密码不正确",
+            data={"field": "old_password", "reason": "原密码不正确"},
+        )
     reference = getattr(account, "student_no", None) or getattr(account, "username", None)
     reason = password_strength_error(new_password, student_no=reference, old_password=old_password)
     if reason:
@@ -371,9 +388,8 @@ def change_password(db: Session, account, *, account_type: str, old_password: st
 
     account.password_hash = hash_password(new_password)
     account.is_first_login = False
-    account.password_changed_at = now
     db.add(account)
-    # 修改密码后其他会话立即失效（文档 2.2）
+    # 修改密码后其他会话立即失效（接口文档 2.2）
     revoke_other_sessions(db, account_type, account.id, keep_session_id)
     db.commit()
 
@@ -395,7 +411,7 @@ def _ua(request: Request | None) -> str | None:
     return ua[:255] if ua else None
 
 
-# 管理员权限点（文档 A-02）
+# 管理员权限点（接口文档 A-02）
 PERMISSIONS: dict[str, list[str]] = {
     AdminRole.SUPER_ADMIN: [
         "dashboard:view",

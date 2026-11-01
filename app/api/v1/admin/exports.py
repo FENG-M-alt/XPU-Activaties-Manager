@@ -1,41 +1,39 @@
 """导出与下载（A-21 / A-32）。"""
 from __future__ import annotations
 
+import secrets
+from pathlib import Path
+
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
-from pathlib import Path
 from sqlalchemy import select
 
 from app.config import settings
 from app.core.deps import CurrentAdmin, DbSession, ensure_activity_access, get_current_admin
-from app.core.enums import ExportTaskStatus, OCCUPYING_STATUSES, RegistrationStatus
+from app.core.enums import OCCUPYING_STATUSES, ExportTaskStatus
 from app.core.errors import ErrorCode, fail
 from app.core.files import file_response
 from app.core.guards import enforce_rate
 from app.core.responses import ok
 from app.core.security import create_download_token, decode_download_token
-from app.core.timeutil import now_local
+from app.core.timeutil import now_local, to_iso
 from app.models.activity import Activity
 from app.models.admin import Admin
 from app.models.registration import Registration
-from app.models.system import ExportTask
+from app.models.supplement import ExportTask
 from app.services import exporter
-from app.services.logs import client_ip, write_log
+from app.services.logs import client_ip, client_ua, write_log
 
 router = APIRouter(tags=["管理端-导出"])
-
-EXPORT_ORDER = (
-    Registration.signup_at.asc(),
-)
 
 
 @router.get("/activities/{activity_id}/export/registrations", summary="A-21 导出报名与签到名单")
 def export_registrations(activity_id: int, db: DbSession, admin: CurrentAdmin, request: Request):
     """同步导出（≤ 1 万行）返回文件流；超出返回 202 与 task_id，随后通过 A-32 下载。"""
     activity = db.get(Activity, activity_id)
-    if activity is None or activity.is_deleted:
+    if activity is None or activity.deleted_at is not None:
         fail(ErrorCode.NOT_FOUND, "活动不存在")
-    ensure_activity_access(admin, activity)
+    ensure_activity_access(admin, activity, db)
     enforce_rate("export", str(admin.id), settings.RATE_EXPORT)
 
     now = now_local()
@@ -45,30 +43,31 @@ def export_registrations(activity_id: int, db: DbSession, admin: CurrentAdmin, r
             Registration.activity_id == activity.id,
             Registration.status.in_(OCCUPYING_STATUSES),
         )
-        .order_by(*EXPORT_ORDER)
+        .order_by(Registration.signup_at.asc())
     ).all()
 
-    import secrets
-
     task_id = secrets.token_hex(12)
-    task = exporter.create_registration_export(db, activity, registrations, task_id=task_id, now=now)
-    task.created_by = admin.id
+    task = exporter.create_registration_export(
+        db, activity, list(registrations), task_id=task_id, operator_id=admin.id, now=now
+    )
     db.add(task)
     write_log(
         db,
-        actor_type="admin",
-        actor_id=admin.id,
-        actor_name=admin.name,
         action="EXPORT_REGISTRATIONS",
-        target_type="activity",
+        operator_type="ADMIN",
+        operator_id=admin.id,
+        target_type="activities",
         target_id=activity.id,
         detail={"row_count": len(registrations), "task_id": task_id},
         ip=client_ip(request),
+        ua=client_ua(request),
     )
     db.commit()
 
     if len(registrations) > settings.EXPORT_SYNC_LIMIT:
-        download_token = create_download_token(subject=admin.id, account_type="admin", path=f"/exports/{task_id}")
+        download_token = create_download_token(
+            subject=admin.id, account_type="admin", path=f"/exports/{task_id}"
+        )
         return JSONResponse(
             status_code=202,
             content=ok(
@@ -77,13 +76,13 @@ def export_registrations(activity_id: int, db: DbSession, admin: CurrentAdmin, r
                     "row_count": len(registrations),
                     "status": ExportTaskStatus.DONE,
                     "download_url": f"{request.base_url}api/v1/admin/exports/{task_id}?token={download_token}",
-                    "expires_at": task.expires_at.isoformat() + "+08:00",
+                    "expires_at": to_iso(task.expires_at),
                 },
                 message="导出文件较大，已生成异步下载任务",
             ),
         )
 
-    return file_response(Path(task.file_path), task.filename or "export.xlsx")
+    return file_response(Path(task.file_path or ""), task.file_name or "export.xlsx")
 
 
 @router.get("/exports/{task_id}", summary="A-32 下载异步导出文件")
@@ -117,7 +116,7 @@ def download_export(
     task.downloaded_at = now_local()
     db.add(task)
     db.commit()
-    return file_response(Path(task.file_path), task.filename or "export.xlsx")
+    return file_response(Path(task.file_path), task.file_name or "export.xlsx")
 
 
 @router.get("/exports", summary="导出任务列表（扩展）")
@@ -132,12 +131,12 @@ def list_exports(db: DbSession, admin: CurrentAdmin):
         {
             "task_id": t.task_id,
             "activity_id": t.activity_id,
-            "filename": t.filename,
+            "file_name": t.file_name,
             "row_count": t.row_count,
             "status": t.status,
-            "created_at": t.created_at.isoformat() + "+08:00",
-            "expires_at": t.expires_at.isoformat() + "+08:00",
-            "downloaded_at": t.downloaded_at.isoformat() + "+08:00" if t.downloaded_at else None,
+            "created_at": to_iso(t.created_at),
+            "expires_at": to_iso(t.expires_at),
+            "downloaded_at": to_iso(t.downloaded_at),
             "download_url": f"/api/v1/admin/exports/{t.task_id}",
         }
         for t in rows

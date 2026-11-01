@@ -11,6 +11,7 @@ from app.core.responses import ok
 from app.core.timeutil import now_local
 from app.models.activity import Activity
 from app.schemas.serializers import activity_list_item, api_base
+from app.services.activity import remaining_map
 
 router = APIRouter(tags=["用户端-分享"])
 
@@ -20,14 +21,20 @@ def share_detail(token: str, db: DbSession, request: Request):
     """token 为 12 位随机字符；链接失效返回 40400，活动取消返回 CANCELLED。"""
     now = now_local()
     activity = db.scalars(
-        select(Activity).where(Activity.share_token == token, Activity.is_deleted.is_(False))
+        select(Activity).where(Activity.share_token == token, Activity.deleted_at.is_(None))
     ).first()
     if activity is None:
         fail(ErrorCode.NOT_FOUND, "分享链接不存在或已失效")
     if activity.share_expire_at and now > activity.share_expire_at:
         fail(ErrorCode.NOT_FOUND, "分享链接已过期")
 
-    data = activity_list_item(activity, now=now)
+    counts = remaining_map(db, [activity.id])
+    data = activity_list_item(
+        activity,
+        now=now,
+        remaining=max(activity.capacity - counts.get(activity.id, 0), 0),
+        registered_count=counts.get(activity.id, 0),
+    )
     data.update(
         {
             "description": activity.description,

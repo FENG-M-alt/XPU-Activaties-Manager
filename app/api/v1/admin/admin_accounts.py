@@ -8,15 +8,16 @@ from sqlalchemy import func, or_, select
 
 from app.config import settings
 from app.core.deps import CurrentAdmin, DbSession, SuperAdmin
-from app.core.enums import AccountStatus, AdminRole, DataScope
+from app.core.enums import AccountStatus, AccountType, AdminRole, DataScope
 from app.core.errors import ErrorCode, fail
 from app.core.files import file_response
 from app.core.responses import Pagination, ok, page_data
 from app.core.security import hash_password, password_strength_error
 from app.core.timeutil import day_end, day_start, now_local, to_iso
-from app.models.audit import OperationLog
-from app.models.system import DictItem, SystemSetting
 from app.models.admin import Admin
+from app.models.dict_item import DictItem
+from app.models.operation_log import OperationLog
+from app.models.setting import Setting
 from app.schemas.requests import (
     AdminCreateIn,
     AdminPatchIn,
@@ -26,7 +27,7 @@ from app.schemas.requests import (
 )
 from app.services import auth as auth_service
 from app.services import exporter
-from app.services.logs import client_ip, write_log
+from app.services.logs import client_ip, client_ua, write_log
 
 router = APIRouter(tags=["管理端-系统"])
 
@@ -35,7 +36,7 @@ router = APIRouter(tags=["管理端-系统"])
 @router.get("/dicts", summary="A-33 字典查询")
 def list_dicts(db: DbSession, admin: CurrentAdmin, dict_type: str | None = Query(None)):
     """按 dict_type 查询字典项；不传时返回全部类型。"""
-    stmt = select(DictItem).where(DictItem.is_active.is_(True))
+    stmt = select(DictItem).where(DictItem.enabled.is_(True))
     if dict_type:
         stmt = stmt.where(DictItem.dict_type == dict_type)
     rows = db.scalars(stmt.order_by(DictItem.dict_type.asc(), DictItem.sort.asc())).all()
@@ -43,7 +44,13 @@ def list_dicts(db: DbSession, admin: CurrentAdmin, dict_type: str | None = Query
     grouped: dict[str, list[dict]] = {}
     for item in rows:
         grouped.setdefault(item.dict_type, []).append(
-            {"id": item.id, "label": item.label, "value": item.value, "sort": item.sort, "remark": item.remark}
+            {
+                "id": item.id,
+                "label": item.label,
+                "value": item.value,
+                "sort": item.sort,
+                "enabled": item.enabled,
+            }
         )
     if dict_type:
         return ok({"dict_type": dict_type, "items": grouped.get(dict_type, [])})
@@ -54,49 +61,58 @@ def list_dicts(db: DbSession, admin: CurrentAdmin, dict_type: str | None = Query
 def create_dict(payload: DictItemIn, db: DbSession, admin: SuperAdmin, request: Request):
     exists = db.scalars(
         select(DictItem).where(
-            DictItem.dict_type == payload.dict_type,
-            DictItem.value == payload.value,
+            DictItem.dict_type == payload.dict_type, DictItem.value == payload.value
         )
     ).first()
     if exists:
         fail(ErrorCode.ILLEGAL_STATE, "同类型下字典值已存在")
-    item = DictItem(**payload.model_dump())
+    item = DictItem(
+        dict_type=payload.dict_type,
+        label=payload.label,
+        value=payload.value,
+        sort=payload.sort,
+        enabled=getattr(payload, "is_active", True),
+    )
     db.add(item)
     db.flush()
     write_log(
         db,
-        actor_type="admin",
-        actor_id=admin.id,
-        actor_name=admin.name,
         action="DICT_CREATE",
-        target_type="dict",
+        operator_type="ADMIN",
+        operator_id=admin.id,
+        target_type="dict_items",
         target_id=item.id,
         detail=payload.model_dump(),
         ip=client_ip(request),
+        ua=client_ua(request),
     )
     db.commit()
     return ok({"id": item.id}, message="已创建")
 
 
 @router.patch("/dicts/{dict_id}", summary="A-33 修改字典项（超管）")
-def update_dict(dict_id: int, payload: DictItemPatchIn, db: DbSession, admin: SuperAdmin, request: Request):
+def update_dict(
+    dict_id: int, payload: DictItemPatchIn, db: DbSession, admin: SuperAdmin, request: Request
+):
     item = db.get(DictItem, dict_id)
     if item is None:
         fail(ErrorCode.NOT_FOUND, "字典项不存在")
     data = payload.model_dump(exclude_unset=True)
+    if "is_active" in data:
+        item.enabled = bool(data.pop("is_active"))
     for field, value in data.items():
         setattr(item, field, value)
     db.add(item)
     write_log(
         db,
-        actor_type="admin",
-        actor_id=admin.id,
-        actor_name=admin.name,
         action="DICT_UPDATE",
-        target_type="dict",
+        operator_type="ADMIN",
+        operator_id=admin.id,
+        target_type="dict_items",
         target_id=item.id,
         detail=data,
         ip=client_ip(request),
+        ua=client_ua(request),
     )
     db.commit()
     return ok({"id": item.id}, message="已保存")
@@ -107,17 +123,17 @@ def delete_dict(dict_id: int, db: DbSession, admin: SuperAdmin, request: Request
     item = db.get(DictItem, dict_id)
     if item is None:
         fail(ErrorCode.NOT_FOUND, "字典项不存在")
-    item.is_active = False
+    item.enabled = False  # 停用不影响历史数据（数据库文档 4.9）
     db.add(item)
     write_log(
         db,
-        actor_type="admin",
-        actor_id=admin.id,
-        actor_name=admin.name,
         action="DICT_DELETE",
-        target_type="dict",
+        operator_type="ADMIN",
+        operator_id=admin.id,
+        target_type="dict_items",
         target_id=item.id,
         ip=client_ip(request),
+        ua=client_ua(request),
     )
     db.commit()
     return ok({"id": dict_id}, message="已删除")
@@ -126,15 +142,14 @@ def delete_dict(dict_id: int, db: DbSession, admin: SuperAdmin, request: Request
 # ---------------------------------------------------------------- A-34 系统参数
 @router.get("/settings", summary="A-34 系统参数查询")
 def list_settings(db: DbSession, admin: CurrentAdmin):
-    """返回参数键值、默认值与说明。"""
-    rows = db.scalars(select(SystemSetting).order_by(SystemSetting.group.asc(), SystemSetting.key.asc())).all()
+    """返回参数键值、说明与最后修改时间（settings 表结构）。"""
+    rows = db.scalars(select(Setting).order_by(Setting.key.asc())).all()
     items = [
         {
             "key": s.key,
-            "value": s.value if s.value is not None else s.default_value,
-            "default_value": s.default_value,
-            "description": s.description,
-            "group": s.group,
+            "value": s.value,
+            "remark": s.remark,
+            "updated_by": s.updated_by,
             "updated_at": to_iso(s.updated_at),
         }
         for s in rows
@@ -143,15 +158,17 @@ def list_settings(db: DbSession, admin: CurrentAdmin):
 
 
 @router.patch("/settings", summary="A-34 更新系统参数（超管）")
-def update_settings(payload: SettingsUpdateIn, db: DbSession, admin: SuperAdmin, request: Request):
+def update_settings(
+    payload: SettingsUpdateIn, db: DbSession, admin: SuperAdmin, request: Request
+):
     """记录修改人与前后值。"""
     changes = []
     for item in payload.items:
-        setting = db.get(SystemSetting, item.key)
+        setting = db.get(Setting, item.key)
         if setting is None:
             fail(ErrorCode.NOT_FOUND, f"参数 {item.key} 不存在")
         before = setting.value
-        setting.value = item.value
+        setting.value = item.value or ""
         setting.updated_by = admin.id
         setting.updated_at = now_local()
         db.add(setting)
@@ -159,13 +176,13 @@ def update_settings(payload: SettingsUpdateIn, db: DbSession, admin: SuperAdmin,
 
     write_log(
         db,
-        actor_type="admin",
-        actor_id=admin.id,
-        actor_name=admin.name,
         action="SETTING_UPDATE",
-        target_type="setting",
+        operator_type="ADMIN",
+        operator_id=admin.id,
+        target_type="settings",
         detail={"changes": changes},
         ip=client_ip(request),
+        ua=client_ua(request),
     )
     db.commit()
     return ok({"updated": len(changes), "changes": changes}, message="已保存")
@@ -178,7 +195,7 @@ def list_logs(
     admin: CurrentAdmin,
     start_date: date | None = Query(None),
     end_date: date | None = Query(None),
-    actor: str | None = Query(None, description="操作人姓名或账号"),
+    actor: str | None = Query(None, description="操作人 ID"),
     action: str | None = Query(None, description="动作关键字"),
     page: int | None = Query(None, ge=1),
     page_size: int | None = Query(None, ge=1),
@@ -187,15 +204,14 @@ def list_logs(
     pagination = Pagination(page, page_size, default_size=settings.DEFAULT_PAGE_SIZE_ADMIN)
     conditions = []
     if admin.role != AdminRole.SUPER_ADMIN:
-        conditions.append(OperationLog.actor_type == "admin")
-        conditions.append(OperationLog.actor_id == admin.id)
+        conditions.append(OperationLog.operator_type == "ADMIN")
+        conditions.append(OperationLog.operator_id == admin.id)
     if start_date:
         conditions.append(OperationLog.created_at >= day_start(start_date))
     if end_date:
         conditions.append(OperationLog.created_at <= day_end(end_date))
-    if actor:
-        like = f"%{actor.strip()}%"
-        conditions.append(OperationLog.actor_name.like(like))
+    if actor and str(actor).isdigit():
+        conditions.append(OperationLog.operator_id == int(actor))
     if action:
         conditions.append(OperationLog.action.like(f"%{action.strip().upper()}%"))
 
@@ -210,14 +226,15 @@ def list_logs(
     items = [
         {
             "id": log.id,
-            "actor_type": log.actor_type,
-            "actor_id": log.actor_id,
-            "actor_name": log.actor_name,
+            "operator_type": log.operator_type,
+            "operator_id": log.operator_id,
             "action": log.action,
             "target_type": log.target_type,
             "target_id": log.target_id,
             "detail": log.detail,
             "ip": log.ip,
+            "ua": log.ua,
+            "result": log.result,
             "created_at": to_iso(log.created_at),
         }
         for log in rows
@@ -229,39 +246,48 @@ def list_logs(
 def export_logs(db: DbSession, admin: CurrentAdmin, request: Request):
     conditions = []
     if admin.role != AdminRole.SUPER_ADMIN:
-        conditions = [OperationLog.actor_type == "admin", OperationLog.actor_id == admin.id]
+        conditions = [
+            OperationLog.operator_type == "ADMIN",
+            OperationLog.operator_id == admin.id,
+        ]
     rows = db.scalars(
-        select(OperationLog).where(*conditions).order_by(OperationLog.created_at.desc()).limit(20000)
+        select(OperationLog)
+        .where(*conditions)
+        .order_by(OperationLog.created_at.desc())
+        .limit(20000)
     ).all()
 
     settings.ensure_dirs()
-    name = f"操作日志_{now_local().strftime('%Y%m%d%H%M')}.xlsx"
-    path = settings.EXPORT_DIR / f"logs_{now_local().strftime('%Y%m%d%H%M%S')}.xlsx"
+    stamp = now_local().strftime("%Y%m%d%H%M%S")
+    path = settings.EXPORT_DIR / f"logs_{stamp}.xlsx"
     exporter.create_generic_export(
         path,
-        ["时间", "操作人类型", "操作人", "动作", "对象类型", "对象ID", "IP", "详情"],
+        ["时间", "操作人类型", "操作人ID", "动作", "对象类型", "对象ID", "IP", "结果", "详情"],
         [
             [
                 to_iso(log.created_at),
-                log.actor_type,
-                log.actor_name or "",
+                log.operator_type,
+                log.operator_id or "",
                 log.action,
                 log.target_type or "",
                 log.target_id or "",
                 log.ip or "",
-                log.detail or "",
+                log.result,
+                str(log.detail or ""),
             ]
             for log in rows
         ],
         "操作日志",
     )
-    return file_response(path, name)
+    return file_response(path, f"操作日志_{stamp[:8]}.xlsx")
 
 
 # ---------------------------------------------------------------- A-36 管理员账号
 @router.get("/admins", summary="A-36 管理员列表（超管）")
 def list_admins(db: DbSession, admin: SuperAdmin):
-    rows = db.scalars(select(Admin).order_by(Admin.created_at.asc())).all()
+    rows = db.scalars(
+        select(Admin).where(Admin.deleted_at.is_(None)).order_by(Admin.created_at.asc())
+    ).all()
     items = [
         {
             "id": a.id,
@@ -271,6 +297,7 @@ def list_admins(db: DbSession, admin: SuperAdmin):
             "data_scope": a.data_scope,
             "college": a.college,
             "status": a.status,
+            "created_by": a.created_by,
             "last_login_at": to_iso(a.last_login_at),
             "created_at": to_iso(a.created_at),
         }
@@ -281,14 +308,19 @@ def list_admins(db: DbSession, admin: SuperAdmin):
 
 @router.post("/admins", summary="A-36 创建管理员（超管）")
 def create_admin(payload: AdminCreateIn, db: DbSession, admin: SuperAdmin, request: Request):
-    if db.scalars(select(Admin).where(Admin.username == payload.username)).first():
+    if db.scalars(
+        select(Admin).where(Admin.username == payload.username, Admin.deleted_at.is_(None))
+    ).first():
         fail(ErrorCode.ILLEGAL_STATE, "账号已存在")
     reason = password_strength_error(payload.password)
     if reason:
         fail(ErrorCode.PARAM_INVALID, reason, data={"field": "password", "reason": reason})
     if payload.data_scope == DataScope.COLLEGE and not payload.college:
-        fail(ErrorCode.PARAM_INVALID, "数据范围为指定学院时必须填写学院",
-             data={"field": "college", "reason": "必填"})
+        fail(
+            ErrorCode.PARAM_INVALID,
+            "数据范围为指定学院时必须填写学院",
+            data={"field": "college", "reason": "必填"},
+        )
 
     created = Admin(
         username=payload.username,
@@ -299,28 +331,31 @@ def create_admin(payload: AdminCreateIn, db: DbSession, admin: SuperAdmin, reque
         college=payload.college,
         status=payload.status,
         is_first_login=True,
+        created_by=admin.id,
     )
     db.add(created)
     db.flush()
     write_log(
         db,
-        actor_type="admin",
-        actor_id=admin.id,
-        actor_name=admin.name,
         action="ADMIN_CREATE",
-        target_type="admin",
+        operator_type="ADMIN",
+        operator_id=admin.id,
+        target_type="admins",
         target_id=created.id,
         detail={"username": created.username, "role": created.role},
         ip=client_ip(request),
+        ua=client_ua(request),
     )
     db.commit()
     return ok({"id": created.id, "username": created.username}, message="管理员已创建")
 
 
 @router.patch("/admins/{admin_id}", summary="A-36 编辑管理员（超管）")
-def update_admin(admin_id: int, payload: AdminPatchIn, db: DbSession, admin: SuperAdmin, request: Request):
+def update_admin(
+    admin_id: int, payload: AdminPatchIn, db: DbSession, admin: SuperAdmin, request: Request
+):
     target = db.get(Admin, admin_id)
-    if target is None:
+    if target is None or target.deleted_at is not None:
         fail(ErrorCode.NOT_FOUND, "管理员不存在")
 
     data = payload.model_dump(exclude_unset=True)
@@ -329,36 +364,39 @@ def update_admin(admin_id: int, payload: AdminPatchIn, db: DbSession, admin: Sup
     if target.id == admin.id and data.get("role") == AdminRole.ADMIN:
         fail(ErrorCode.ILLEGAL_STATE, "不能降级当前登录账号")
 
-    if "password" in data and data["password"]:
+    if data.get("password"):
         reason = password_strength_error(data["password"])
         if reason:
             fail(ErrorCode.PARAM_INVALID, reason, data={"field": "password", "reason": reason})
         target.password_hash = hash_password(data.pop("password"))
         target.is_first_login = True
-        auth_service.revoke_other_sessions(db, "admin", target.id, keep_session_id=None)
+        auth_service.revoke_other_sessions(db, AccountType.ADMIN, target.id, keep_session_id=None)
 
     scope = data.get("data_scope", target.data_scope)
     college = data.get("college", target.college)
     if scope == DataScope.COLLEGE and not college:
-        fail(ErrorCode.PARAM_INVALID, "数据范围为指定学院时必须填写学院",
-             data={"field": "college", "reason": "必填"})
+        fail(
+            ErrorCode.PARAM_INVALID,
+            "数据范围为指定学院时必须填写学院",
+            data={"field": "college", "reason": "必填"},
+        )
 
     for field, value in data.items():
         setattr(target, field, value)
     if data.get("status") == AccountStatus.DISABLED:
-        auth_service.revoke_other_sessions(db, "admin", target.id, keep_session_id=None)
+        auth_service.revoke_other_sessions(db, AccountType.ADMIN, target.id, keep_session_id=None)
 
     db.add(target)
     write_log(
         db,
-        actor_type="admin",
-        actor_id=admin.id,
-        actor_name=admin.name,
         action="ADMIN_UPDATE",
-        target_type="admin",
+        operator_type="ADMIN",
+        operator_id=admin.id,
+        target_type="admins",
         target_id=target.id,
         detail={"fields": list(data.keys())},
         ip=client_ip(request),
+        ua=client_ua(request),
     )
     db.commit()
     return ok({"id": target.id}, message="已保存")

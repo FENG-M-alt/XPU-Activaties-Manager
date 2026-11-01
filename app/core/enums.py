@@ -113,3 +113,32 @@ FINISHED_GROUP_STATUSES: tuple[str, ...] = (
     RegistrationStatus.COMPLETED,
     RegistrationStatus.ABSENT,
 )
+
+
+class AccountType(StrEnum):
+    """会话归属主体（auth_sessions.account_type）。"""
+
+    USER = "user"       # 学生（users）
+    ADMIN = "admin"     # 管理员（admins）
+
+
+class LogResult(StrEnum):
+    """operation_logs.result（文档 4.7）。"""
+
+    SUCCESS = "SUCCESS"
+    FAIL = "FAIL"
+
+
+class LogOperatorType(StrEnum):
+    """operation_logs.operator_type（文档 4.7）。"""
+
+    ADMIN = "ADMIN"
+    STUDENT = "STUDENT"
+    SYSTEM = "SYSTEM"
+
+
+class NoticeType(StrEnum):
+    """公告分类，取值来自 dict_items(dict_type='notice_type')（文档 4.9 / 9.1）。"""
+
+    SYSTEM = "system"
+    ACTIVITY = "activity"

@@ -1,6 +1,7 @@
 """密码、令牌与验证码等安全原语。
 
-- 密码：PBKDF2-HMAC-SHA256（标准库，无额外依赖），格式 pbkdf2_sha256$iterations$salt$hash
+- 密码：bcrypt（cost=12），符合《数据库设计说明书》8.1「bcrypt（cost ≥ 10）」
+  同时兼容校验历史 PBKDF2 哈希，便于存量数据平滑迁移
 - 访问令牌：JWT（HS256），2 小时有效，绑定会话 ID，可随会话撤销立即失效
 - 刷新令牌：高熵随机串，仅存 SHA-256 摘要，写入 HttpOnly Cookie
 """
@@ -16,32 +17,60 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import bcrypt
 import jwt
 
 from app.config import settings
 
-PBKDF2_ITERATIONS = 260_000
+BCRYPT_ROUNDS = 12
+PBKDF2_ITERATIONS = 260_000  # 仅用于校验历史数据
 _ALPHABET = string.ascii_letters + string.digits
 
 
 # ---------------------------------------------------------------- 密码
 def hash_password(password: str) -> str:
-    salt = secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), PBKDF2_ITERATIONS)
-    return f"pbkdf2_sha256${PBKDF2_ITERATIONS}${salt}${digest.hex()}"
+    """生成 bcrypt 哈希（60 字符，适配 password_hash VARCHAR(100)）。"""
+    raw = password.encode("utf-8")
+    if len(raw) > 72:  # bcrypt 只取前 72 字节
+        raw = raw[:72]
+    return bcrypt.hashpw(raw, bcrypt.gensalt(rounds=BCRYPT_ROUNDS)).decode("ascii")
 
 
-def verify_password(password: str, stored: str | None) -> bool:
-    if not stored:
-        return False
+def _verify_pbkdf2(password: str, stored: str) -> bool:
     try:
         algo, iterations, salt, digest = stored.split("$", 3)
         if algo != "pbkdf2_sha256":
             return False
-        expected = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), int(iterations))
+        expected = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), salt.encode("utf-8"), int(iterations)
+        )
         return hmac.compare_digest(expected.hex(), digest)
     except (ValueError, TypeError):
         return False
+
+
+def verify_password(password: str, stored: str | None) -> bool:
+    """校验密码；支持 bcrypt（$2a/$2b/$2y）与历史 PBKDF2 两种格式。"""
+    if not stored:
+        return False
+    if stored.startswith(("$2a$", "$2b$", "$2y$")):
+        raw = password.encode("utf-8")
+        if len(raw) > 72:
+            raw = raw[:72]
+        try:
+            return bcrypt.checkpw(raw, stored.encode("ascii"))
+        except (ValueError, TypeError):
+            return False
+    if stored.startswith("pbkdf2_sha256$"):
+        return _verify_pbkdf2(password, stored)
+    return False
+
+
+def password_needs_rehash(stored: str | None) -> bool:
+    """历史 PBKDF2 哈希建议在下次登录时升级为 bcrypt。"""
+    if not stored:
+        return False
+    return stored.startswith("pbkdf2_sha256$")
 
 
 def password_strength_error(password: str, student_no: str | None = None, old_password: str | None = None) -> str | None:

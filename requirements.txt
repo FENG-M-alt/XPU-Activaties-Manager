@@ -8,5 +8,11 @@ python-multipart==0.0.32
 openpyxl==3.1.5
 email-validator==2.3.0
 
+# 密码哈希（《数据库设计说明书》8.1：bcrypt cost >= 10）
+bcrypt==5.0.0
+
+# MySQL 驱动（《数据库设计说明书》2.1：MySQL 8.0）
+PyMySQL==2.2.8
+
 # 测试（可选）
 httpx==0.28.1
