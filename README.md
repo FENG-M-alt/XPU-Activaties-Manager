@@ -7,9 +7,9 @@
 | --- | --- |
 | 技术栈 | Python 3.13 · FastAPI 0.162 · SQLAlchemy 2.1 · Pydantic 2 · PyJWT · openpyxl |
 | 接口前缀 | `/api/v1`，管理端统一 `/api/v1/admin` |
-| 数据库 | 默认 SQLite（零配置），通过 `DATABASE_URL` 可切换 MySQL / PostgreSQL |
+| 数据库 | MySQL 8.0（`lab_checkin` 库，InnoDB / utf8mb4）；`DATABASE_URL` 也可指向 SQLite / PostgreSQL |
 | 文档 | 启动后访问 <http://127.0.0.1:8000/docs>（OpenAPI 3.0，74 个操作） |
-| 自测 | `python tests/smoke_test.py` —— **201 项断言全部通过** |
+| 测试 | 联调指南见 [TEST.md](TEST.md)：预置账号/活动、错误码触发方法、参考数值 |
 
 ---
 
@@ -25,52 +25,55 @@
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-首次启动会**自动建表并写入示例数据**（`AUTO_SEED=true`）：
+数据由 SQL 脚本预置（应用不再自动写入示例数据）：
 
 - 接口文档：<http://127.0.0.1:8000/docs>
 - 健康检查：<http://127.0.0.1:8000/api/v1/health>
 - 枚举字典：<http://127.0.0.1:8000/api/v1/enums>
+- **测试指南：[TEST.md](TEST.md)**（账号、数据、测试路线、错误码触发方法）
 
-### 示例账号
+### 预置账号
 
 | 角色 | 账号 | 密码 | 说明 |
 | --- | --- | --- | --- |
 | 超级管理员 | `superadmin` | `Admin@123456` | 全校数据范围 |
 | 学院管理员 | `csadmin` | `Admin@123456` | 数据范围 COLLEGE，计算机学院 |
+| 普通管理员 | `teacher01` | `Admin@123456` | 数据范围 SELF，仅本人创建 |
 | 学生 | `2024010101` | `Student@2026` | 首次登录需改密（`is_first_login=true`） |
-| 学生 | 其余 11 个示例学号 | `Student@2026` | 见 `app/seed.py` |
+| 学生 | `2024010102` ~ `2024040102` | `Student@2026` | 共 10 个可用 |
+| 已停用学生 | `2023010102` | `Student@2026` | 用于测试 40102 |
 
-> 生产部署前务必修改 `JWT_SECRET`、关闭 `AUTO_SEED`、删除示例账号。
+> 生产部署前务必修改 `JWT_SECRET`、删除示例账号、关闭 `DEBUG`。
 
-### 重新初始化
+### 重置演示数据
 
 ```powershell
-Remove-Item lab_checkin.db          # 删除开发库
-python -m app.seed                  # 重新建表 + 示例数据
+mysql -u root -p lab_checkin --execute="source sql/04_demo_data.sql"
 ```
+
+> 脚本内时间基于 `NOW()` 相对计算，重跑后"进行中活动 + 签到窗口"始终有效；主键固定，文档中的 ID 长期可用。
 
 ---
 
 ## 2. 目录结构
 
 ```
-app/
+app/                          # 应用源码（60 个 .py）
 ├── main.py                  # 应用装配：中间件、异常处理、静态资源、后台状态任务
 ├── config.py                # 全部配置（环境变量 / .env 覆盖）
-├── database.py              # 引擎、会话、SQLite PRAGMA(WAL/外键)
-├── seed.py                  # 示例数据（幂等）
+├── database.py              # 引擎、会话、MySQL/SQLite 连接参数
 ├── core/
 │   ├── errors.py            # 业务码 + BizError + HTTP 映射（文档第 8 章）
 │   ├── responses.py         # 统一信封 ok() / 分页
 │   ├── context.py           # trace_id 上下文
-│   ├── security.py          # PBKDF2 密码、JWT、验证码、脱敏、恒定时间比较
+│   ├── security.py          # bcrypt 密码、JWT、验证码、脱敏、恒定时间比较
 │   ├── deps.py              # 认证依赖、数据范围过滤
 │   ├── enums.py             # 文档 6.1 全部枚举
 │   ├── guards.py            # 限流、幂等
 │   ├── timeutil.py          # 东八区时间、学期/周/月区间
 │   ├── sanitize.py          # 富文本白名单过滤
 │   └── files.py             # 下载响应、路径穿越防护
-├── models/                  # 15 张表（学生/管理员/活动/报名/公告/会话/日志/字典/参数/导入导出…）
+├── models/                  # 12 张表（9 官方 + 3 补充：会话 / 公告 / 导出）
 ├── schemas/
 │   ├── requests.py          # 请求体校验模型
 │   └── serializers.py       # 输出 DTO（时间统一 ISO8601+08:00）
@@ -87,7 +90,6 @@ app/
     ├── auth.py  me.py  home.py  activities.py  registrations.py  notices.py  share.py
     └── admin/  auth.py dashboard.py activities.py registrations.py
                 students.py stats.py exports.py notices.py admin_accounts.py uploads.py
-tests/smoke_test.py          # 端到端冒烟测试（独立 test_smoke.db）
 ```
 
 ---
@@ -191,11 +193,11 @@ tests/smoke_test.py          # 端到端冒烟测试（独立 test_smoke.db）
 
 ## 5. 关键业务规则的实现方式
 
-**名额不超卖** —— `UPDATE activities SET registered_count = registered_count + 1 WHERE id = ? AND registered_count < capacity` 原子扣减，`rowcount = 0` 即返回 `40901`；取消/拒绝时原子回退，并支持 `recount_registered()` 修正计数漂移。待审核记录在提交时即预占名额（文档 7.1.2）。
+**名额不超卖** —— 按数据库文档 6.2：`SELECT ... FOR UPDATE` 锁活动行 → 按状态聚合有效报名数 → 未达上限才插入；`uk_activity_user` 唯一索引兜底重复报名（`40902`）。有效报名数为实时聚合、不设冗余列，取消/拒绝后名额自然释放。
 
 **状态机与惰性校正** —— `effective_status()` 按当前时间推算展示状态；读接口触发 `sync_activity()` 落库校正，另有后台任务每 60 秒批量推进（`ENABLE_STATE_TASK`）。活动结束自动把 `APPROVED` 置 `ABSENT`；活动开始自动把 `PENDING` 置 `REJECTED`（理由"活动已开始，未完成审核"）。
 
-**签到 8 步校验**（文档 4.9 顺序）——登录 → 活动未取消/未结束 `40904` → 无报名 `40400` → 状态非已通过 `40907`（已签到直接 `40908`）→ 不在签到窗 `40906` → 码不匹配 `40905`、命中历史旧码 `40910` → 重复签到 `40908` → 连续输错 5 次锁定 10 分钟 `40909`。签到码用 `hmac.compare_digest` 恒定时间比较；每次尝试落 `checkin_attempts` 表。
+**签到 8 步校验**（文档 4.9 顺序）——登录 → 活动未取消/未结束 `40904` → 无报名 `40400` → 状态非已通过 `40907`（已签到直接 `40908`）→ 不在签到窗 `40906` → 码不匹配 `40905`、命中历史旧码 `40910` → 重复签到 `40908` → 连续输错 5 次锁定 10 分钟 `40909`。签到码用 `hmac.compare_digest` 恒定时间比较；连错计数保存在进程内 TTL（不落库，重启清零）。
 
 **数据范围**（2.7）——查询层过滤：`ALL` 全校、`COLLEGE` 本学院（`activity.college` 或本人创建）、`SELF` 仅本人创建；越权返回 `40300` 且不返回任何数据。学生端只能访问本人资源。
 
@@ -220,20 +222,23 @@ tests/smoke_test.py          # 端到端冒烟测试（独立 test_smoke.db）
 
 ## 7. 测试
 
-```powershell
-.\.venv\Scripts\python.exe tests\smoke_test.py
-```
+自动化测试脚本（原 `tests/` 目录）已移除，改为「SQL 预置数据 + 文档化用例 + `/docs` 图形化调用」的验证方式：
 
-- 使用独立库 `test_smoke.db`，不污染开发数据；覆盖 53 个文档接口 + 关键错误码 + 数据范围 + 幂等/锁定/名额/旧码失效等边界。
-- 当前结果：**201 项断言全部通过**。
+- **测试指南**：[TEST.md](TEST.md) —— 预置账号与 7 类活动、学生端/管理端测试路线、18 个错误码的触发方法、参考数值、数据重置方法。
+- **测试数据**：`sql/04_demo_data.sql`，时间基于 `NOW()` 相对生成，可反复执行；主键固定（users 1–12、activities 1–7、registrations 1–24）。
+- **图形化验证**：启动后打开 <http://127.0.0.1:8000/docs>，点右上角 **Authorize** 粘贴 `access_token`，即可逐个接口调用。
 
-数据库表：`students`、`admins`、`activity_types`、`activities`、`activity_checkin_codes`、`registrations`、`notices`、`auth_sessions`、`login_attempts`、`checkin_attempts`、`operation_logs`、`dict_items`、`system_settings`、`import_batches`、`export_tasks`。
+数据库共 12 张表（9 张官方 + 3 张补充）：
+
+`users`、`admins`、`activities`、`registrations`、`checkin_logs`、`import_batches`、`operation_logs`、`settings`、`dict_items`，以及 `auth_sessions`、`notices`、`export_tasks`。
+
+> 如需恢复自动化回归（接口级冒烟 + 状态机断言），可按 TEST.md 的用例重新生成脚本。
 
 ---
 
 ## 8. 生产部署清单
 
-1. `.env` 中设置强随机 `JWT_SECRET`，`AUTO_SEED=false`，`DEBUG=false`。
+1. `.env` 中设置强随机 `JWT_SECRET`，`DEBUG=false`，并按需收紧数据库账号权限。
 2. `DATABASE_URL` 切换 MySQL/PostgreSQL；用 Alembic（或自建迁移）替代 `create_all`。
 3. `COOKIE_SECURE=true`（HTTPS 下必须），`COOKIE_SAMESITE=lax`，`CORS_ORIGINS` 改为具体前端域名。
 4. 多 worker 时把限流/幂等/验证码迁移到 Redis；`ENABLE_STATE_TASK` 仅在一个实例开启，或改用外部调度。
@@ -288,7 +293,7 @@ DATABASE_URL=mysql+pymysql://lab_checkin:你的密码@127.0.0.1:3306/lab_checkin
 AUTO_CREATE_TABLES=false
 ```
 
-启动后访问 `/api/v1/health` 验证连通性；首次启动保持 `AUTO_SEED=true` 可自动写入管理员与示例学生（bcrypt 哈希无法用 SQL 生成，故账号由应用侧写入）。
+启动后访问 `/api/v1/health` 验证连通性。管理员与示例学生由 `sql/04_demo_data.sql` 预置（bcrypt 哈希已内联在脚本中），应用侧不再写入任何样例数据。
 
 ## 3. 本次数据层重构要点
 

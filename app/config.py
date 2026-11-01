@@ -125,7 +125,7 @@ class Settings:
     MAKEUP_CHECKIN_DAYS: int = _env_int("MAKEUP_CHECKIN_DAYS", 7)
 
     # --- 启动行为 ---
-    AUTO_SEED: bool = _env_bool("AUTO_SEED", True)
+    # 说明：演示数据由 sql/04_demo_data.sql 预置，应用侧不再自动写样例数据。
     ENABLE_STATE_TASK: bool = _env_bool("ENABLE_STATE_TASK", True)
     STATE_TASK_INTERVAL: int = _env_int("STATE_TASK_INTERVAL", 60)
     LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO")

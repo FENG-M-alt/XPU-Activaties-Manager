@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
 from app.config import settings
-from app.core.deps import CurrentAdmin, DbSession, ensure_activity_access, get_current_admin
+from app.core.deps import CurrentAdmin, DbSession, authenticate_admin_header, ensure_activity_access
 from app.core.enums import OCCUPYING_STATUSES, ExportTaskStatus
 from app.core.errors import ErrorCode, fail
 from app.core.files import file_response
@@ -101,7 +101,7 @@ def download_export(
         if admin is None:
             fail(ErrorCode.UNAUTHORIZED)
     else:
-        admin = get_current_admin(db=db, authorization=request.headers.get("authorization"))
+        admin = authenticate_admin_header(db, request.headers.get("authorization"))
 
     task = db.scalars(select(ExportTask).where(ExportTask.task_id == task_id)).first()
     if task is None:

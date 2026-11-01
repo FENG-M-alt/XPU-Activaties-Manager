@@ -4,7 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Request, Response
 
 from app.config import settings
-from app.core.deps import CurrentUser, DbSession, OptionalPrincipal, PrincipalDep, get_optional_user
+from app.core.deps import DbSession, OptionalPrincipal, OptionalUser, PrincipalDep
 from app.core.enums import AccountType
 from app.core.errors import ErrorCode, fail
 from app.core.guards import enforce_rate
@@ -104,8 +104,7 @@ def change_password(
 
 
 @router.get("/auth/check", summary="校验当前会话是否有效（辅助接口）")
-def check_session(db: DbSession, request: Request):
-    user = get_optional_user(db=db, authorization=request.headers.get("authorization"))
+def check_session(user: OptionalUser):
     if user is None:
         return ok({"authenticated": False})
     return ok({"authenticated": True, "student_no": user.student_no, "name": user.name})

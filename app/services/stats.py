@@ -49,8 +49,11 @@ def _count(db: Session, stmt: Select) -> int:
 
 
 def visible_filters() -> list:
-    """统计仅计入已发布及之后状态、且未软删除的活动。"""
-    return [Activity.deleted_at.is_(None), Activity.status.notin_([ActivityStatus.DRAFT])]
+    """统计口径：与活动列表一致，排除草稿与已取消、且未软删除的活动。"""
+    return [
+        Activity.deleted_at.is_(None),
+        Activity.status.notin_([ActivityStatus.DRAFT, ActivityStatus.CANCELLED]),
+    ]
 
 
 def _month_expr(db: Session):

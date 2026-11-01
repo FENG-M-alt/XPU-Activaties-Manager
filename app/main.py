@@ -64,17 +64,6 @@ async def lifespan(app: FastAPI):
     settings.ensure_dirs()
     init_db()
 
-    if settings.AUTO_SEED:
-        from app.seed import seed_if_empty
-
-        db = SessionLocal()
-        try:
-            seed_if_empty(db)
-        except Exception:  # pragma: no cover
-            logger.exception("初始化示例数据失败")
-        finally:
-            db.close()
-
     stop = asyncio.Event()
     task = None
     if settings.ENABLE_STATE_TASK:

@@ -1,18 +1,21 @@
 """FastAPI 依赖：数据库、当前用户、权限与数据范围（文档 2.7）。
 
+认证使用标准 HTTP Bearer 安全方案（``HTTPBearer``），而不是普通 header 参数：
+- OpenAPI 会声明 ``securitySchemes.HTTPBearer``，``/docs`` 出现右上角 Authorize 按钮，
+  只需粘贴 login 返回的 access_token，Swagger 自动补 ``Bearer `` 前缀；
+- 避免"普通 header 参数 + 可空类型"在 OpenAPI 3.1 下被 Swagger UI 丢弃、导致请求
+  实际未携带 Authorization 的问题。
+
 账号类型统一使用 ``user`` / ``admin``（对应 users / admins 两张表）。
-数据范围（data_scope）：
-- ALL     全校数据；
-- COLLEGE 本学院数据 —— activities 表无学院字段，按"创建人属于本学院"过滤，
-          报名/学生数据按快照字段或 users.college 过滤；
-- SELF    仅本人创建。
+数据范围（data_scope）：ALL 全校 / COLLEGE 本学院（按创建人归属） / SELF 本人创建。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Annotated
 
-from fastapi import Depends, Header
+from fastapi import Depends
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
@@ -25,6 +28,15 @@ from app.models.user import User
 from app.services.auth import get_session
 
 DbSession = Annotated[Session, Depends(get_db)]
+
+# auto_error=False：未携带令牌时返回 None，交给各依赖决定"必须登录"还是"可匿名"
+bearer_scheme = HTTPBearer(
+    auto_error=False,
+    scheme_name="HTTPBearer",
+    description="粘贴登录接口返回的 access_token（无需手写 Bearer 前缀，Swagger 会自动补全）",
+)
+
+BearerCred = Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)]
 
 
 @dataclass(slots=True)
@@ -44,6 +56,7 @@ class Principal:
 
 
 def _bearer_token(authorization: str | None) -> str | None:
+    """从原始 Authorization 头中取出令牌（供非依赖注入的调用方使用）。"""
     if not authorization:
         return None
     parts = authorization.split(None, 1)
@@ -54,12 +67,11 @@ def _bearer_token(authorization: str | None) -> str | None:
 
 def _resolve_principal(
     db: Session,
-    authorization: str | None,
+    token: str | None,
     *,
     required_type: str | None = None,
     optional: bool = False,
 ) -> Principal | None:
-    token = _bearer_token(authorization)
     if not token:
         if optional:
             return None
@@ -73,7 +85,7 @@ def _resolve_principal(
 
     account_type = payload.get("typ")
     if required_type and account_type != required_type:
-        # 学生令牌访问管理端接口一律 403（文档 2.2）
+        # 学生令牌访问管理端接口一律 403（接口文档 2.2）
         fail(ErrorCode.FORBIDDEN)
 
     session_id = payload.get("sid")
@@ -102,7 +114,9 @@ def _resolve_principal(
             fail(ErrorCode.ACCOUNT_DISABLED)
         if session.account_id != user.id:
             fail(ErrorCode.UNAUTHORIZED)
-        return Principal(account_type=AccountType.USER, id=user.id, session_id=session_id, user=user)
+        return Principal(
+            account_type=AccountType.USER, id=user.id, session_id=session_id, user=user
+        )
 
     if account_type == AccountType.ADMIN:
         admin = db.get(Admin, account_id)
@@ -112,58 +126,65 @@ def _resolve_principal(
             fail(ErrorCode.ACCOUNT_DISABLED)
         if session.account_id != admin.id:
             fail(ErrorCode.UNAUTHORIZED)
-        return Principal(account_type=AccountType.ADMIN, id=admin.id, session_id=session_id, admin=admin)
+        return Principal(
+            account_type=AccountType.ADMIN, id=admin.id, session_id=session_id, admin=admin
+        )
 
     fail(ErrorCode.UNAUTHORIZED)
 
 
-def get_current_user(
-    db: DbSession,
-    authorization: Annotated[str | None, Header(alias="Authorization")] = None,
-) -> User:
-    principal = _resolve_principal(db, authorization, required_type=AccountType.USER)
+def get_current_user(db: DbSession, credentials: BearerCred) -> User:
+    principal = _resolve_principal(
+        db, credentials.credentials if credentials else None, required_type=AccountType.USER
+    )
     assert principal and principal.user is not None
     return principal.user
 
 
-def get_optional_user(
-    db: DbSession,
-    authorization: Annotated[str | None, Header(alias="Authorization")] = None,
-) -> User | None:
-    principal = _resolve_principal(db, authorization, required_type=AccountType.USER, optional=True)
+def get_optional_user(db: DbSession, credentials: BearerCred) -> User | None:
+    principal = _resolve_principal(
+        db,
+        credentials.credentials if credentials else None,
+        required_type=AccountType.USER,
+        optional=True,
+    )
     return principal.user if principal else None
 
 
-def get_current_admin(
-    db: DbSession,
-    authorization: Annotated[str | None, Header(alias="Authorization")] = None,
-) -> Admin:
-    principal = _resolve_principal(db, authorization, required_type=AccountType.ADMIN)
+def get_current_admin(db: DbSession, credentials: BearerCred) -> Admin:
+    principal = _resolve_principal(
+        db, credentials.credentials if credentials else None, required_type=AccountType.ADMIN
+    )
     assert principal and principal.admin is not None
     return principal.admin
 
 
-def get_current_principal(
-    db: DbSession,
-    authorization: Annotated[str | None, Header(alias="Authorization")] = None,
-) -> Principal:
-    principal = _resolve_principal(db, authorization)
+def get_current_principal(db: DbSession, credentials: BearerCred) -> Principal:
+    principal = _resolve_principal(db, credentials.credentials if credentials else None)
     assert principal is not None
     return principal
 
 
-def get_optional_principal(
-    db: DbSession,
-    authorization: Annotated[str | None, Header(alias="Authorization")] = None,
-) -> Principal | None:
+def get_optional_principal(db: DbSession, credentials: BearerCred) -> Principal | None:
     """可选认证：无令牌或令牌失效时返回 None，不抛异常（用于退出登录等）。"""
-    return _resolve_principal(db, authorization, optional=True)
+    return _resolve_principal(
+        db, credentials.credentials if credentials else None, optional=True
+    )
 
 
 def require_super_admin(admin: Annotated[Admin, Depends(get_current_admin)]) -> Admin:
     if admin.role != AdminRole.SUPER_ADMIN:
         fail(ErrorCode.FORBIDDEN, "该操作仅超级管理员可执行")
     return admin
+
+
+def authenticate_admin_header(db: Session, authorization: str | None) -> Admin:
+    """按原始 Authorization 头认证管理员（供带令牌的下载接口等非依赖场景使用）。"""
+    principal = _resolve_principal(
+        db, _bearer_token(authorization), required_type=AccountType.ADMIN
+    )
+    assert principal and principal.admin is not None
+    return principal.admin
 
 
 # 学生端主体（保留 CurrentStudent 命名，语义即 users 表记录）
@@ -187,7 +208,7 @@ def _college_admin_ids(db: Session, college: str) -> list[int]:
 
 
 def activity_scope_conditions(admin: Admin, db: Session | None = None) -> list:
-    """管理端活动查询按 data_scope 过滤（文档 2.7）。"""
+    """管理端活动查询按 data_scope 过滤（接口文档 2.7）。"""
     from app.models.activity import Activity
 
     if admin.role == AdminRole.SUPER_ADMIN or admin.data_scope == DataScope.ALL:
