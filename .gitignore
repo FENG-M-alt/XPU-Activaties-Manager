@@ -1,11 +1,10 @@
-# Python
+
 __pycache__/
 *.py[cod]
 .venv/
 
-# 数据库与运行数据
 storage/
 
-# 环境
 .env
 *.pdf
+test.py

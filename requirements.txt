@@ -11,6 +11,9 @@ email-validator==2.3.0
 # 密码哈希（《数据库设计说明书》8.1：bcrypt cost >= 10）
 bcrypt==5.0.0
 
+# 身份证号字段加密（《数据库设计说明书》8.2：AES-256-GCM）
+cryptography==50.0.2
+
 # MySQL 驱动（《数据库设计说明书》2.1：MySQL 8.0）
 PyMySQL==2.2.8
 

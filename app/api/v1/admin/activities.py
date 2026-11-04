@@ -354,8 +354,24 @@ def update_activity(
 
     _apply_create_fields(activity, payload)
     _validate_times(activity)
-    activity.version += 1
-    db.add(activity)
+
+    # 乐观锁：写入语句本身带 version 条件，rowcount=0 即并发冲突。
+    # 仅在 Python 里比 version 无法阻止"两个请求同时通过校验后互相覆盖"。
+    values = {f: getattr(activity, f) for f in changed if hasattr(activity, f)}
+    values["version"] = payload.version + 1
+    result = db.execute(
+        update(Activity)
+        .where(
+            Activity.id == activity.id,
+            Activity.version == payload.version,
+            Activity.deleted_at.is_(None),
+        )
+        .values(**values)
+    )
+    if result.rowcount == 0:
+        db.rollback()
+        fail(ErrorCode.ILLEGAL_STATE, "活动已被他人修改，请刷新后重试")
+
     write_log(
         db,
         action="ACTIVITY_UPDATE",
@@ -363,7 +379,7 @@ def update_activity(
         operator_id=admin.id,
         target_type="activities",
         target_id=activity.id,
-        detail={"fields": list(changed.keys()), "version": activity.version},
+        detail={"fields": list(changed.keys()), "version": payload.version + 1},
         ip=client_ip(request),
         ua=client_ua(request),
     )

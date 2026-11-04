@@ -101,9 +101,15 @@ AUTO_CREATE_TABLES=false
 
 ### 4.1 学生端主流程（约 10 分钟）
 
+> ⚠️ `2024010101` 是**首登需改密**账号（`is_first_login=1`）。未改密前只放行
+> `GET /me`、`POST /auth/password`、`POST /auth/logout`、`POST /auth/refresh`、`GET /auth/check`，
+> 其余接口一律 `403 / 40300` 且 `data.reason="need_change_password"`。
+> **请先执行第 0 步改密**；若想跳过，可改用 `2024010102` 等已改密账号（但下文预期数值是按 `2024010101` 写的）。
+
 | 步骤 | 接口 | 预期 |
 | --- | --- | --- |
-| 1 | `POST /api/v1/auth/login` `{"student_no":"2024010101","password":"Student@2026"}` | `code=0`，返回 `access_token`、`is_first_login=true`，响应头 `Set-Cookie: refresh_token=...` |
+| 0 | `POST /api/v1/auth/password` `{"old_password":"Student@2026","new_password":"Student@2028"}` | `code=0`；此后业务接口才放行。**测完可重跑 `sql/04_demo_data.sql` 还原密码** |
+| 1 | `POST /api/v1/auth/login` `{"student_no":"2024010101","password":"Student@2026"}` | `code=0`，返回 `access_token`、`is_first_login=true`，响应头 `Set-Cookie: refresh_token=...`；此时调 `GET /activities` 应得 `40300` |
 | 2 | `GET /api/v1/me`（Bearer） | 手机号脱敏为 `138****0101`；`total_activities=1`、`total_hours=2.0` |
 | 3 | `GET /api/v1/home` | `todo.checkin_available` 统计、公告只返回 2 条（第 3 条已过期不下发） |
 | 4 | `GET /api/v1/activities` | 只出现 7 个中的 **5 个**（草稿 #5、已取消 #7 均不出现在学生列表）；`remaining` 与 §3 一致 |
@@ -202,7 +208,7 @@ curl -X POST http://127.0.0.1:8000/api/v1/activities/1/checkin \
 | `40300` | 用 `csadmin` 查外国语学院学生记录；或用学生 token 调 `/admin/me` | 403 |
 | `40400` | `GET /activities/999`；`GET /share/aaaaaaaaaaaa` | 404 |
 | `40901` | 用 `2024010103` 报名活动 3（2/2 满员） | 409 |
-| `40902` | 同一学生对同一活动重复报名（如 `2024010101` 报名活动 1） | 409 |
+| `40902` | 报名窗口开放的活动重复报名（如 `2024010103` 已 PENDING，再提交活动 2） | 409 |
 | `40903` | 报名活动 6（报名未开始） | 409 |
 | `40904` | 报名活动 7（已取消）；或 `PATCH /admin/activities/1` 传错 `version` | 409 |
 | `40905` | 签到码输成 `000000` | 409 |
@@ -217,7 +223,7 @@ curl -X POST http://127.0.0.1:8000/api/v1/activities/1/checkin \
 
 - **幂等**：同一次报名在 5 秒内重复提交 → 第二次返回 `message="重复提交，返回首次结果"` 且 `registration_id` 相同；
 - **名额释放**：取消活动 2 的报名后，「已占名额」立即减少（聚合而来，无冗余计数）；
-- **强制改密**：`2024010101` 登录后 `is_first_login=true`，调 `POST /auth/password` 后该字段变 `false`，且**其他会话立即失效**；
+- **强制改密**：`2024010101` 登录后 `is_first_login=true`，此时 `GET /activities`、`POST /activities/2/registrations` 等业务接口返回 `40300`（`data.reason=need_change_password`），而 `GET /me` 正常；调 `POST /auth/password` 后该字段变 `false`、业务接口恢复 200，且**其他会话立即失效**；
 - **会话上限**：同一账号登录 4 次，最早的会话失效（旧 token 调 `/me` 返回 40100）；
 - **软删除**：`DELETE /admin/activities/5`（草稿）后，列表不再出现，但记录仍在库中（`deleted_at` 非空）。
 
@@ -293,7 +299,7 @@ mysql -u root -p lab_checkin --execute="source sql/04_demo_data.sql"
 2. **重启服务会清空**上述内存状态：验证码全部失效、锁定计时归零、幂等窗口清空。
 3. **`tests/` 自动化脚本已移除**：原 `smoke_test.py`、`test_state_machine.py` 依赖已删除的 `app/seed.py` 与旧表结构，已清理。全部验证请按本文档的路线手工执行，或用 `/docs`；如需恢复自动化回归，可按本文用例重新生成。
 4. `DEBUG=true` 时 `GET /me` 会额外返回 `mobile_raw`（未脱敏手机号），生产需关闭。
-5. `2024010101` 首次登录必须改密后才能正常使用其他功能（前端据此跳转改密页）。
+5. **首登强制改密已由后端强制**：`is_first_login=1` 时业务接口返回 `40300`（`data.reason=need_change_password`），仅放行 `GET /me` / 改密 / 退出 / 刷新；`A-26 重置密码` 会把该标记重新置 1，用户需再次改密。
 6. 导出文件落在 `storage/exports/`，路由 `/api/v1/exports/{task_id}` 下载，7 天过期。
 7. 时间统一东八区：数据库存本地时间，接口输出 `+08:00`；`sql/04_demo_data.sql` 已 `SET time_zone='+08:00'`，与应用一致。
 

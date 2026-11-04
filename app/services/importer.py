@@ -23,6 +23,7 @@ from app.config import settings
 from app.core.cache import cache
 from app.core.enums import AccountStatus, ImportResult
 from app.core.errors import ErrorCode, fail
+from app.core.crypto import decrypt_id_card, encrypt_id_card
 from app.core.security import hash_password
 from app.core.timeutil import now_local
 from app.models.import_batch import ImportBatch
@@ -39,6 +40,12 @@ REQUIRED_HEADERS = {
     "手机号": "mobile",
 }
 
+# 可选列：身份证号（加密入库，不参与必填校验）
+OPTIONAL_HEADERS = {
+    "身份证号": "id_card",
+    "身份证": "id_card",
+}
+
 HEADER_ALIASES = {
     "student_no": "student_no",
     "name": "name",
@@ -49,10 +56,12 @@ HEADER_ALIASES = {
     "grade": "grade",
     "mobile": "mobile",
     "phone": "mobile",
+    "id_card": "id_card",
 }
 
 STUDENT_NO_RE = re.compile(r"^[A-Za-z0-9]{6,20}$")
 MOBILE_RE = re.compile(r"^1[3-9]\d{9}$")
+ID_CARD_RE = re.compile(r"^\d{17}[\dXx]$")
 XLSX_MAGIC = b"PK\x03\x04"
 
 
@@ -114,6 +123,8 @@ def parse_workbook(content: bytes) -> tuple[list[dict], list[dict], int]:
             continue
         if key in REQUIRED_HEADERS:
             mapping[idx] = REQUIRED_HEADERS[key]
+        elif key in OPTIONAL_HEADERS:
+            mapping[idx] = OPTIONAL_HEADERS[key]
         elif key.lower() in HEADER_ALIASES:
             mapping[idx] = HEADER_ALIASES[key.lower()]
 
@@ -145,6 +156,7 @@ def parse_workbook(content: bytes) -> tuple[list[dict], list[dict], int]:
                 data={"field": "file", "reason": "行数超限"},
             )
         record = {field: None for field in REQUIRED_HEADERS.values()}
+        record["id_card"] = None
         for idx, field in mapping.items():
             if idx < len(raw):
                 record[field] = _cell_text(raw[idx])
@@ -174,6 +186,10 @@ def _validate_row(record: dict, seen: set[str]) -> str | None:
     mobile = record.get("mobile")
     if mobile and not MOBILE_RE.match(mobile):
         return "手机号格式不正确"
+    id_card = record.get("id_card")
+    if id_card:
+        if not ID_CARD_RE.match(id_card):
+            return "身份证号格式不正确（须为 18 位，末位可为 X；请把该列设为文本格式）"
     return None
 
 
@@ -231,6 +247,52 @@ def generate_initial_password() -> str:
             return pwd
 
 
+DEFAULT_PASSWORD_RULE = "id_card_tail6"
+
+
+def get_setting(db: Session, key: str, default: str | None = None) -> str | None:
+    """读取 settings 表中的系统参数。"""
+    from app.models.setting import Setting
+
+    row = db.get(Setting, key)
+    if row is None or row.value is None:
+        return default
+    return row.value
+
+
+def _tail6(value: str | None) -> str | None:
+    if not value:
+        return None
+    tail = str(value).strip()[-6:]
+    return tail or None
+
+
+def build_initial_password(
+    db: Session,
+    student_no: str,
+    *,
+    id_card_plain: str | None = None,
+    id_card_enc: str | None = None,
+) -> str:
+    """按 settings.init_password_rule 生成初始密码（数据库设计说明书 9.2）。
+
+    规则 `id_card_tail6`：
+      · 有身份证号 → 取身份证号后 6 位；
+      · 无身份证号 → 取学号后 6 位（文档原文"无身份证号时取学号后 6 位"）。
+    密文按文档 8.2"仅在生成初始密码时解密"：重置密码时可传 id_card_enc 现场解密。
+    未知规则值退化为随机 10 位，避免生成空密码。
+    """
+    rule = (get_setting(db, "init_password_rule", DEFAULT_PASSWORD_RULE) or "").strip()
+    if rule == DEFAULT_PASSWORD_RULE:
+        plain = id_card_plain
+        if not plain and id_card_enc:
+            plain = decrypt_id_card(id_card_enc)
+        password = _tail6(plain) or _tail6(student_no)
+        if password:
+            return password
+    return generate_initial_password()
+
+
 def confirm_batch(
     db: Session,
     batch: ImportBatch,
@@ -269,7 +331,9 @@ def confirm_batch(
                 updated += 1
                 continue
 
-            password = generate_initial_password()
+            raw_id_card = record.get("id_card")
+            # 初始密码按 settings.init_password_rule 生成（有身份证取后 6 位，否则学号后 6 位）
+            password = build_initial_password(db, student_no, id_card_plain=raw_id_card)
             user = User(
                 student_no=student_no,
                 name=record.get("name") or "",
@@ -278,6 +342,7 @@ def confirm_batch(
                 class_name=record.get("class_name"),
                 grade=int(record["grade"]) if record.get("grade") and str(record["grade"]).isdigit() else None,
                 mobile=record.get("mobile"),
+                id_card_enc=encrypt_id_card(raw_id_card) if raw_id_card else None,
                 password_hash=hash_password(password),
                 status=AccountStatus.ACTIVE,
                 is_first_login=True,

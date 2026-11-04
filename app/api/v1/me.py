@@ -1,11 +1,11 @@
 """个人中心路由（U-05 / U-06 / U-13 / U-16）。"""
 from __future__ import annotations
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import func, select
 
 from app.config import settings
-from app.core.deps import CurrentUser, DbSession
+from app.core.deps import CurrentUser, DbSession, require_password_change_done
 from app.core.enums import FINISHED_GROUP_STATUSES, RegistrationStatus
 from app.core.errors import ErrorCode, fail
 from app.core.responses import Pagination, ok, page_data
@@ -26,7 +26,7 @@ def get_me(user: CurrentUser, db: DbSession):
     return ok(student_me(user, summary))
 
 
-@router.patch("/me", summary="U-06 修改个人信息")
+@router.patch("/me", summary="U-06 修改个人信息", dependencies=[Depends(require_password_change_done)])
 def update_me(payload: UpdateMeIn, user: CurrentUser, request: Request, db: DbSession):
     """仅允许修改手机号；姓名、学号、学院等字段提交即返回 40001。"""
     user.mobile = payload.mobile
@@ -47,7 +47,7 @@ def update_me(payload: UpdateMeIn, user: CurrentUser, request: Request, db: DbSe
     return ok(student_me(user, student_stats(db, user.id)["summary"]), message="保存成功")
 
 
-@router.get("/me/registrations", summary="U-13 我的报名")
+@router.get("/me/registrations", summary="U-13 我的报名", dependencies=[Depends(require_password_change_done)])
 def my_registrations(
     user: CurrentUser,
     db: DbSession,
@@ -105,7 +105,7 @@ def my_registrations(
     )
 
 
-@router.get("/me/stats", summary="U-16 我的统计")
+@router.get("/me/stats", summary="U-16 我的统计", dependencies=[Depends(require_password_change_done)])
 def my_stats(user: CurrentUser, db: DbSession):
     """个人统计概览、类型分布、近 6 个月趋势与活动明细（接口文档 4.10 口径）。"""
     data = student_stats(db, user.id)

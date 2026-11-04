@@ -92,5 +92,17 @@ def remember(key: str, payload: Any) -> None:
     cache.set(key, payload, settings.IDEMPOTENCY_WINDOW)
 
 
+def invalidate_signup_idempotency(user_id: int, activity_id: int) -> None:
+    """报名状态发生变化（如取消）后作废该用户对该活动的报名幂等键。
+
+    幂等窗口 5 秒内"取消 → 立刻重报"会命中旧结果，返回已失效的首个响应；
+    取消报名时主动失效，可让后续请求真正重新走业务校验。
+    """
+    from app.config import settings
+
+    path = f"{settings.API_PREFIX}/activities/{activity_id}/registrations"
+    cache.delete(idempotency_key("user", user_id, path, None))
+
+
 def clear_idempotency() -> None:
     cache.clear()

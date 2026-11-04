@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -144,11 +144,27 @@ def submit_checkin(
     except ValueError:
         grace = 0
 
-    registration.status = RegistrationStatus.CHECKED_IN
-    registration.checkin_at = now
-    registration.checkin_method = CheckinMethod.CODE
-    registration.is_late = compute_is_late(activity, now, grace)
-    db.add(registration)
+    is_late = compute_is_late(activity, now, grace)
+    record_ip = ip if _record_ip_enabled(db) else None
+
+    # 原子条件更新：只有仍为 APPROVED 的报名能被置为 CHECKED_IN。
+    # 并发重复提交时仅一条能命中（rowcount=1），其余 rowcount=0 → 40908。
+    result = db.execute(
+        update(Registration)
+        .where(
+            Registration.id == registration.id,
+            Registration.status == RegistrationStatus.APPROVED,
+        )
+        .values(
+            status=RegistrationStatus.CHECKED_IN,
+            checkin_at=now,
+            checkin_method=CheckinMethod.CODE,
+            is_late=is_late,
+        )
+    )
+    if result.rowcount == 0:
+        db.rollback()
+        fail(ErrorCode.ALREADY_CHECKED_IN, "已签到，无需重复签到")
 
     db.add(
         CheckinLog(
@@ -156,7 +172,7 @@ def submit_checkin(
             action=CheckinAction.CHECKIN,
             method=CheckinMethod.CODE,
             operator_id=None,  # 学生自助签到，无操作人
-            ip=ip if _record_ip_enabled(db) else None,
+            ip=record_ip,
             created_at=now,
         )
     )

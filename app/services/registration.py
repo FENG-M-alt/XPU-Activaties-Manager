@@ -51,6 +51,24 @@ def count_occupying(db: Session, activity_id: int) -> int:
     )
 
 
+def count_occupying_locked(db: Session, activity_id: int) -> int:
+    """加锁计数（当前读）。
+
+    必须在已持有活动行锁之后调用：MySQL 默认 REPEATABLE READ 下普通 SELECT 走事务快照，
+    看不到其它事务刚提交的报名，会放过超员请求；`FOR UPDATE` 属"当前读"，
+    返回已提交的最新数据。SQLite 忽略 FOR UPDATE，但写事务本身串行。
+    """
+    stmt = (
+        select(Registration.id)
+        .where(
+            Registration.activity_id == activity_id,
+            Registration.status.in_(OCCUPYING_STATUSES),
+        )
+        .with_for_update()
+    )
+    return len(db.scalars(stmt).all())
+
+
 def count_approved(db: Session, activity_id: int) -> int:
     return int(
         db.scalar(
@@ -126,7 +144,8 @@ def create_registration(
     ):
         fail(ErrorCode.DUPLICATE_SIGNUP)
 
-    used = count_occupying(db, activity.id)
+    # 用加锁计数（当前读），避免 REPEATABLE READ 快照导致超卖
+    used = count_occupying_locked(db, activity.id)
     if used >= locked.capacity:
         fail(ErrorCode.CAPACITY_FULL)
 

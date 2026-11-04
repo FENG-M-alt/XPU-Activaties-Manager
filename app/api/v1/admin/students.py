@@ -14,6 +14,7 @@ from app.core.enums import AccountStatus, AccountType, RegistrationStatus
 from app.core.errors import ErrorCode, fail
 from app.core.files import file_response
 from app.core.responses import Pagination, ok, page_data
+from app.core.crypto import masked_from_encrypted
 from app.core.security import hash_password, mask_mobile
 from app.core.timeutil import now_local, to_iso
 from app.models.activity import Activity
@@ -62,6 +63,8 @@ def _user_payload(user: User, aggregates: dict | None = None) -> dict:
         "class_name": user.class_name,
         "grade": user.grade,
         "mobile": mask_mobile(user.mobile),
+        # 身份证号只输出脱敏值；未配置密钥或密文损坏时为空
+        "id_card_masked": masked_from_encrypted(user.id_card_enc),
         "status": user.status,
         "is_first_login": user.is_first_login,
         "import_batch_id": user.import_batch_id,
@@ -311,7 +314,10 @@ def patch_student(
 
     initial_password = None
     if payload.reset_password:
-        initial_password = importer.generate_initial_password()
+        # 重置密码同样按初始密码规则生成；无明文时按文档 8.2 从密文解密后取后 6 位
+        initial_password = importer.build_initial_password(
+            db, user.student_no, id_card_enc=user.id_card_enc
+        )
         user.password_hash = hash_password(initial_password)
         user.is_first_login = True
         changes["reset_password"] = True

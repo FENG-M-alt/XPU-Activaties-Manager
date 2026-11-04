@@ -188,6 +188,43 @@ def authenticate_admin_header(db: Session, authorization: str | None) -> Admin:
 
 
 # 学生端主体（保留 CurrentStudent 命名，语义即 users 表记录）
+# ---------------------------------------------------------------- 首登强制改密
+# 数据库设计说明书 4.1：is_first_login「1 表示需强制改密，默认 1」；
+# 4.2 admin 同名字段「首次登录需改密」。未改密前只允许：
+#   GET /me、POST /auth/password、POST /auth/logout、POST /auth/refresh、GET /auth/check
+# 其余业务接口返回 40300，由前端跳转到改密页。
+def _need_change_password() -> None:
+    fail(
+        ErrorCode.FORBIDDEN,
+        "首次登录请先修改初始密码",
+        data={"field": "is_first_login", "reason": "need_change_password"},
+    )
+
+
+def require_password_change_done(principal: OptionalPrincipal) -> None:
+    """学生端首登守卫。
+
+    用"可选主体"而非强制依赖：无 token 时直接放行，交由路由自身的鉴权给出 401；
+    令牌属于管理员时不在此拦截，让管理端的角色校验优先返回"无权限"。
+    """
+    if principal is None or principal.user is None:
+        return
+    if principal.user.is_first_login:
+        _need_change_password()
+
+
+def require_admin_password_change_done(principal: OptionalPrincipal) -> None:
+    """管理端首登守卫。
+
+    例外：无 token 的请求（如 A-32 带下载令牌直接点链接）不拦截，
+    由其自身校验下载令牌；学生 token 也不在此拦截，交给 CurrentAdmin 返回 40300。
+    """
+    if principal is None or principal.admin is None:
+        return
+    if principal.admin.is_first_login:
+        _need_change_password()
+
+
 CurrentUser = Annotated[User, Depends(get_current_user)]
 OptionalUser = Annotated[User | None, Depends(get_optional_user)]
 CurrentStudent = CurrentUser

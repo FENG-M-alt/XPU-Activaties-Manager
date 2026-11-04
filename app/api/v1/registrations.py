@@ -6,6 +6,7 @@ from sqlalchemy import select
 
 from app.core.deps import CurrentUser, DbSession
 from app.core.errors import ErrorCode, fail
+from app.core.guards import invalidate_signup_idempotency
 from app.core.responses import ok
 from app.core.timeutil import now_local, to_iso
 from app.models.registration import Registration
@@ -51,6 +52,10 @@ def cancel_registration(registration_id: int, db: DbSession, user: CurrentUser, 
         ua=client_ua(request),
     )
     db.commit()
+
+    # 取消后作废报名幂等键，避免 5 秒内重报命中"已成功"的旧响应（OBS-01）
+    invalidate_signup_idempotency(user.id, registration.activity_id)
+
     return ok(
         {
             "registration_id": registration.id,

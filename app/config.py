@@ -78,6 +78,10 @@ class Settings:
     DB_POOL_TIMEOUT: int = _env_int("DB_POOL_TIMEOUT", 30)
     DB_CONNECT_TIMEOUT: int = _env_int("DB_CONNECT_TIMEOUT", 10)
 
+    # --- 敏感字段加密（数据库文档 8.2）---
+    # 32 字节密钥的 base64url 编码；缺失时禁用身份证号加密（拒绝写入明文）
+    ID_CARD_KEY: str | None = os.environ.get("ID_CARD_KEY") or None
+
     # --- 认证（文档 2.2） ---
     JWT_SECRET: str = os.environ.get("JWT_SECRET", "dev-only-secret-change-me-in-production")
     JWT_ALGORITHM: str = os.environ.get("JWT_ALGORITHM", "HS256")
